@@ -2,6 +2,16 @@ import { randomUUID } from "node:crypto";
 import type { ChatCompletionRequest, OpenAIMessage, OpenAIUsage } from "../types/openai.js";
 import type { ZaiCompletionError, ZaiCompletionEvent } from "../types/zai.js";
 
+export type NormalizedZaiCompletionEvent = {
+  raw: ZaiCompletionEvent | null;
+  delta: string;
+  phase: string | null;
+  usage: OpenAIUsage | null;
+  error: ZaiCompletionError | null;
+  done: boolean;
+  isReasoning: boolean;
+};
+
 export function flattenMessageContent(message: OpenAIMessage): string {
   if (typeof message.content === "string") {
     return message.content || formatToolCalls(message);
@@ -11,11 +21,19 @@ export function flattenMessageContent(message: OpenAIMessage): string {
   }
   return message.content
     .map((part) => {
-      if (part.type === "text") {
+      if (part.type === "text" || part.type === "input_text") {
         return part.text;
       }
       if (part.type === "image_url") {
-        return `[image_url: ${part.image_url.url}]`;
+        return `![image](${part.image_url.url})`;
+      }
+      if (part.type === "input_image") {
+        if (part.image_url) {
+          return `![image](${part.image_url})`;
+        }
+        if (part.file_id) {
+          return `[image_file: ${part.file_id}]`;
+        }
       }
       return "";
     })
@@ -141,11 +159,63 @@ export function parseZaiEvent(data: string): ZaiCompletionEvent | null {
   }
 }
 
+export function normalizeZaiCompletionEvent(data: string): NormalizedZaiCompletionEvent {
+  const parsed = parseZaiEvent(data);
+  const root = isRecord(parsed) ? (parsed as Record<string, unknown>) : null;
+  const payload = isRecord(root?.data) ? root.data : null;
+  const nestedPayload = isRecord(payload?.data) ? payload.data : null;
+  const phase = firstString(payload?.phase, nestedPayload?.phase, root?.type);
+  const delta = firstString(
+    payload?.delta_content,
+    payload?.delta,
+    payload?.content,
+    nestedPayload?.delta_content,
+    nestedPayload?.delta,
+    nestedPayload?.content
+  ) ?? "";
+  const usage = normalizeUsage(payload?.usage ?? nestedPayload?.usage ?? root?.usage);
+  const error = getZaiError(parsed);
+  const done =
+    data === "[DONE]" ||
+    booleanValue(payload?.done) ||
+    booleanValue(nestedPayload?.done) ||
+    phase === "done" ||
+    phase === "chat:done" ||
+    phase === "response.done";
+
+  return {
+    raw: parsed,
+    delta,
+    phase,
+    usage,
+    error,
+    done,
+    isReasoning: phase === "thinking" || phase === "reasoning" || phase === "think" || phase === "analysis"
+  };
+}
+
 export function getZaiError(event: ZaiCompletionEvent | null): ZaiCompletionError | null {
   if (!event) {
     return null;
   }
-  return event.error ?? event.data?.error ?? event.data?.data?.error ?? null;
+  const root = event as unknown as Record<string, unknown>;
+  const payload = isRecord(root.data) ? root.data : null;
+  const nestedPayload = isRecord(payload?.data) ? payload.data : null;
+  const explicitError = event.error ?? event.data?.error ?? event.data?.data?.error;
+  if (explicitError) {
+    return explicitError;
+  }
+  if (root.type === "error" || payload?.type === "error") {
+    const message = firstString(root.message, root.detail, payload?.message, payload?.detail);
+    const code = firstString(root.code, root.error_code, payload?.code, payload?.error_code) ?? "upstream_error";
+    return message ? { code, message } : { code };
+  }
+  if (nestedPayload?.type === "error") {
+    const message = firstString(nestedPayload.message, nestedPayload.detail);
+    const code = firstString(nestedPayload.code, nestedPayload.error_code) ?? "upstream_error";
+    return message ? { code, message } : { code };
+  }
+  return null;
 }
 
 export function formatZaiError(error: ZaiCompletionError): string {
@@ -155,4 +225,53 @@ export function formatZaiError(error: ZaiCompletionError): string {
     return `${code}: ${detail}`;
   }
   return detail ?? code ?? "Z.ai upstream error";
+}
+
+export function normalizeUsage(value: unknown): OpenAIUsage | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const promptTokens = numberValue(value.prompt_tokens);
+  const completionTokens = numberValue(value.completion_tokens);
+  const totalTokens = numberValue(value.total_tokens);
+  if (promptTokens === null && completionTokens === null && totalTokens === null) {
+    return null;
+  }
+  return {
+    prompt_tokens: promptTokens ?? 0,
+    completion_tokens: completionTokens ?? 0,
+    total_tokens: totalTokens ?? (promptTokens ?? 0) + (completionTokens ?? 0),
+    ...(isRecord(value.prompt_tokens_details) ? { prompt_tokens_details: value.prompt_tokens_details } : {}),
+    ...(isRecord(value.completion_tokens_details)
+      ? { completion_tokens_details: value.completion_tokens_details }
+      : {})
+  };
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function booleanValue(value: unknown): boolean {
+  return value === true || value === "true";
+}
+
+function numberValue(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }

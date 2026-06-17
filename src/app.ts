@@ -43,9 +43,9 @@ export function createApp(container: AppContainer): Hono {
   );
 
   app.route("/health", healthRoutes(zai));
+  app.route("/v1/health", healthRoutes(zai));
 
   app.use("/v1/*", requireProxyAuth);
-  app.route("/v1/health", healthRoutes(zai));
   app.route("/v1/models", modelRoutes(zai));
   app.route("/v1", proxyToolRoutes());
   app.route("/v1", chatRoutes(zai));

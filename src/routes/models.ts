@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { ZaiClient } from "../services/zai-client.js";
 import { openAIError } from "../lib/openai-error.js";
 import type { OpenAIModel } from "../types/openai.js";
+import { canonicalModelId, findModel } from "../constants/models.js";
 
 export function modelRoutes(zai: ZaiClient): Hono {
   const app = new Hono();
@@ -16,10 +17,10 @@ export function modelRoutes(zai: ZaiClient): Hono {
   });
 
   app.get("/:id", async (c) => {
-    const id = c.req.param("id");
+    const id = canonicalModelId(c.req.param("id"));
     const verbose = isVerbose(c.req.query("verbose"));
     const models = await zai.listModels();
-    const model = models.find((item) => item.id === id);
+    const model = findModel(models, id);
     if (!model) {
       const error = openAIError(`Model '${id}' not found`, 404, "model_not_found", "invalid_request_error");
       return c.json(error.body, error.status);

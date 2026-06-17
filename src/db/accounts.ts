@@ -1,6 +1,6 @@
 import type { AppDatabase } from "./database.js";
 import type { CryptoBox } from "../lib/crypto.js";
-import type { ZaiAccount } from "../types/zai.js";
+import type { ZaiAccount, ZaiBrowserFingerprint } from "../types/zai.js";
 
 type AccountRow = {
   id: string;
@@ -10,6 +10,7 @@ type AccountRow = {
   encrypted_token: string;
   encrypted_cookies: string;
   encrypted_local_storage: string;
+  encrypted_browser_fingerprint: string | null;
   browser_profile_path: string;
   user_agent: string;
   status: "active" | "invalid" | "disabled" | "limited";
@@ -29,6 +30,7 @@ export type SaveAccountInput = {
   token: string;
   cookies: unknown[];
   localStorage: Record<string, string>;
+  browserFingerprint?: ZaiBrowserFingerprint | null;
   browserProfilePath: string;
   userAgent: string;
 };
@@ -49,11 +51,11 @@ export class AccountRepository {
         `
         INSERT INTO accounts (
           id, provider, email, display_name, encrypted_token,
-          encrypted_cookies, encrypted_local_storage, browser_profile_path,
+          encrypted_cookies, encrypted_local_storage, encrypted_browser_fingerprint, browser_profile_path,
           user_agent, status, created_at, updated_at, last_login_at, last_validated_at
         ) VALUES (
           @id, 'zai', @email, @displayName, @encryptedToken,
-          @encryptedCookies, @encryptedLocalStorage, @browserProfilePath,
+          @encryptedCookies, @encryptedLocalStorage, @encryptedBrowserFingerprint, @browserProfilePath,
           @userAgent, 'active', @createdAt, @updatedAt, @lastLoginAt, @lastValidatedAt
         )
         ON CONFLICT(id) DO UPDATE SET
@@ -62,6 +64,7 @@ export class AccountRepository {
           encrypted_token = excluded.encrypted_token,
           encrypted_cookies = excluded.encrypted_cookies,
           encrypted_local_storage = excluded.encrypted_local_storage,
+          encrypted_browser_fingerprint = excluded.encrypted_browser_fingerprint,
           browser_profile_path = excluded.browser_profile_path,
           user_agent = excluded.user_agent,
           status = 'active',
@@ -80,6 +83,7 @@ export class AccountRepository {
         encryptedToken: this.crypto.encrypt(input.token),
         encryptedCookies: this.crypto.encrypt(input.cookies),
         encryptedLocalStorage: this.crypto.encrypt(input.localStorage),
+        encryptedBrowserFingerprint: input.browserFingerprint ? this.crypto.encrypt(input.browserFingerprint) : null,
         browserProfilePath: input.browserProfilePath,
         userAgent: input.userAgent,
         createdAt,
@@ -219,6 +223,9 @@ export class AccountRepository {
       token: this.crypto.decrypt<string>(row.encrypted_token),
       cookies: this.crypto.decrypt<unknown[]>(row.encrypted_cookies),
       localStorage: this.crypto.decrypt<Record<string, string>>(row.encrypted_local_storage),
+      browserFingerprint: row.encrypted_browser_fingerprint
+        ? this.crypto.decrypt<ZaiBrowserFingerprint>(row.encrypted_browser_fingerprint)
+        : null,
       browserProfilePath: row.browser_profile_path,
       userAgent: row.user_agent,
       status: row.status,

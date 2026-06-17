@@ -24,6 +24,7 @@ function migrate(db: AppDatabase): void {
       encrypted_token TEXT NOT NULL,
       encrypted_cookies TEXT NOT NULL,
       encrypted_local_storage TEXT NOT NULL,
+      encrypted_browser_fingerprint TEXT,
       browser_profile_path TEXT NOT NULL,
       user_agent TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'active',
@@ -72,6 +73,7 @@ function migrate(db: AppDatabase): void {
   addColumnIfMissing(db, "accounts", "failure_count", "INTEGER NOT NULL DEFAULT 0");
   addColumnIfMissing(db, "accounts", "last_error", "TEXT");
   addColumnIfMissing(db, "accounts", "limited_until", "TEXT");
+  addColumnIfMissing(db, "accounts", "encrypted_browser_fingerprint", "TEXT");
 }
 
 function addColumnIfMissing(

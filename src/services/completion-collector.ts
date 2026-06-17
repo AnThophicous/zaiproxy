@@ -1,6 +1,8 @@
 import { parseSse } from "../lib/sse.js";
 import type { OpenAIUsage } from "../types/openai.js";
-import { formatZaiError, getZaiError, parseZaiEvent } from "./openai-transform.js";
+import { formatZaiError, normalizeZaiCompletionEvent } from "./openai-transform.js";
+
+export { normalizeUsage } from "./openai-transform.js";
 
 export type CollectedCompletion = {
   content: string;
@@ -8,8 +10,15 @@ export type CollectedCompletion = {
   usage: OpenAIUsage | null;
 };
 
+export type CollectZaiCompletionOptions = {
+  returnPartialOnError?: boolean;
+  onContentDelta?: (delta: string) => void;
+  onReasoningDelta?: (delta: string) => void;
+};
+
 export async function collectZaiCompletion(
-  upstream: ReadableStream<Uint8Array> | null
+  upstream: ReadableStream<Uint8Array> | null,
+  options: CollectZaiCompletionOptions = {}
 ): Promise<CollectedCompletion> {
   if (!upstream) {
     throw new Error("Z.ai response body is empty");
@@ -20,30 +29,27 @@ export async function collectZaiCompletion(
   let usage: OpenAIUsage | null = null;
 
   for await (const event of parseSse(upstream)) {
-    const parsed = parseZaiEvent(event.data);
-    const upstreamError = getZaiError(parsed);
-    if (upstreamError) {
-      throw new Error(formatZaiError(upstreamError));
-    }
-    if (!parsed?.data) {
-      continue;
-    }
+    const parsed = normalizeZaiCompletionEvent(event.data);
 
-    const currentUsage = normalizeUsage(parsed.data.usage);
-    if (currentUsage) {
-      usage = currentUsage;
+    if (parsed.error) {
+      if (options.returnPartialOnError && (content || reasoningContent || usage)) {
+        break;
+      }
+      throw new Error(formatZaiError(parsed.error));
     }
-
-    const delta = parsed.data.delta_content;
-    if (delta) {
-      if (parsed.data.phase === "thinking") {
-        reasoningContent += delta;
+    if (parsed.usage) {
+      usage = parsed.usage;
+    }
+    if (parsed.delta) {
+      if (parsed.isReasoning) {
+        reasoningContent += parsed.delta;
+        options.onReasoningDelta?.(parsed.delta);
       } else {
-        content += delta;
+        content += parsed.delta;
+        options.onContentDelta?.(parsed.delta);
       }
     }
-
-    if (parsed.data.done || parsed.data.phase === "done") {
+    if (parsed.done) {
       break;
     }
   }
@@ -70,36 +76,4 @@ export function addUsage(left: OpenAIUsage | null, right: OpenAIUsage | null): O
         }
       : {})
   };
-}
-
-export function normalizeUsage(value: unknown): OpenAIUsage | null {
-  if (!value || typeof value !== "object") {
-    return null;
-  }
-  const usage = value as Record<string, unknown>;
-  const promptTokens = numberValue(usage.prompt_tokens);
-  const completionTokens = numberValue(usage.completion_tokens);
-  const totalTokens = numberValue(usage.total_tokens);
-  if (promptTokens === null && completionTokens === null && totalTokens === null) {
-    return null;
-  }
-  return {
-    prompt_tokens: promptTokens ?? 0,
-    completion_tokens: completionTokens ?? 0,
-    total_tokens: totalTokens ?? (promptTokens ?? 0) + (completionTokens ?? 0),
-    ...(isRecord(usage.prompt_tokens_details)
-      ? { prompt_tokens_details: usage.prompt_tokens_details }
-      : {}),
-    ...(isRecord(usage.completion_tokens_details)
-      ? { completion_tokens_details: usage.completion_tokens_details }
-      : {})
-  };
-}
-
-function numberValue(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }

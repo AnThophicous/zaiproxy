@@ -4,7 +4,7 @@ import type { Context } from "hono";
 import { z } from "zod";
 import { config } from "../config/env.js";
 import type { ResponseRepository } from "../db/responses.js";
-import { upstreamErrorCode, upstreamStatus } from "../lib/http-status.js";
+import { upstreamErrorCode, upstreamErrorType, upstreamStatus } from "../lib/http-status.js";
 import { openAIError } from "../lib/openai-error.js";
 import { parseSse } from "../lib/sse.js";
 import { logger } from "../lib/logger.js";
@@ -22,8 +22,12 @@ import type {
   OpenAIUsage
 } from "../types/openai.js";
 import type { ZaiClient } from "../services/zai-client.js";
-import { formatZaiError, getZaiError, parseZaiEvent } from "../services/openai-transform.js";
-import { maybeRunToolBridge, type ToolBridgeResult } from "../services/tool-bridge.js";
+import {
+  formatZaiError,
+  normalizeUsage,
+  normalizeZaiCompletionEvent
+} from "../services/openai-transform.js";
+import { maybeRunToolBridge, usesToolBridge, type ToolBridgeResult } from "../services/tool-bridge.js";
 
 type ResponsesRequest = {
   model: string;
@@ -41,6 +45,7 @@ type ResponsesRequest = {
   previous_response_id?: string;
   metadata?: unknown;
   store?: boolean;
+  reasoning?: unknown;
   zai?: ChatCompletionRequest["zai"];
 };
 
@@ -104,7 +109,17 @@ async function handleResponseCreate(c: Context, zai: ZaiClient, responseStore?: 
     const id = `resp_${randomUUID()}`;
     const messageId = `msg_${randomUUID()}`;
     const createdAt = Math.floor(Date.now() / 1000);
-    const conversationKey = responseConversationKey(request, id, responseStore);
+    const conversationKeyResult = responseConversationKey(request, id, responseStore);
+    if (!conversationKeyResult.ok) {
+      const error = openAIError(
+        `Previous response '${conversationKeyResult.previousResponseId}' not found`,
+        404,
+        "response_not_found",
+        "invalid_request_error"
+      );
+      return c.json(error.body, error.status);
+    }
+    const conversationKey = conversationKeyResult.conversationKey;
     const chatRequest = toChatRequest(request, conversationKey);
     const active = createActiveRequest({
       id,
@@ -115,6 +130,21 @@ async function handleResponseCreate(c: Context, zai: ZaiClient, responseStore?: 
     });
 
     try {
+      if (request.stream && usesToolBridge(chatRequest)) {
+        responseConversationKeys.set(id, conversationKey);
+        return streamToolBridgeResponseLive(
+          zai,
+          chatRequest,
+          request,
+          id,
+          messageId,
+          createdAt,
+          conversationKey,
+          active,
+          responseStore
+        );
+      }
+
       const toolResult = await maybeRunToolBridge(zai, chatRequest, active.signal);
       if (toolResult) {
         if (request.stream) {
@@ -124,7 +154,7 @@ async function handleResponseCreate(c: Context, zai: ZaiClient, responseStore?: 
         const response = responseObjectFromToolBridge(request, toolResult, id, messageId, createdAt);
         rememberResponse(id, response, conversationKey, responseStore);
         active.complete();
-        return c.json(response);
+        return c.json(response, 200, responseIdHeaders(id));
       }
 
       const upstream = await zai.createCompletionStream(chatRequest, active.signal);
@@ -138,21 +168,38 @@ async function handleResponseCreate(c: Context, zai: ZaiClient, responseStore?: 
       }
 
       const completion = await collectResponseCompletion(upstream.body);
-      const response = responseObject(request, id, messageId, createdAt, "completed", completion.content, completion.usage);
+      const response = responseObject(
+        request,
+        id,
+        messageId,
+        createdAt,
+        "completed",
+        completion.content,
+        completion.usage,
+        null,
+        responseOutputWithReasoning(
+          request,
+          messageId,
+          "completed",
+          completion.content,
+          completion.sawReasoning,
+          completion.reasoningContent
+        )
+      );
       rememberResponse(id, response, conversationKey, responseStore);
       active.complete();
-      return c.json(response);
+      return c.json(response, 200, responseIdHeaders(id));
     } catch (error) {
       active.complete();
       if (isAbortError(error)) {
         const response = responseObject(request, id, messageId, createdAt, "cancelled", "", null);
         rememberResponse(id, response, conversationKey, responseStore);
-        return c.json(response);
+        return c.json(response, 200, responseIdHeaders(id));
       }
       const message = error instanceof Error ? error.message : String(error);
       logger.error("HTTP", "Responses request failed", message);
       const status = upstreamStatus(message);
-      const response = openAIError(message, status, upstreamErrorCode(status));
+      const response = openAIError(message, status, upstreamErrorCode(status), upstreamErrorType(status));
       return c.json(response.body, response.status);
     }
 }
@@ -167,19 +214,33 @@ async function cancelResponseRequest(c: Context, responseStore?: ResponseReposit
 
   const result = cancelActiveRequest(id, "client_requested_cancel");
   const responseId = result.ok ? result.id : id;
-  const stored = storedResponses.get(responseId) ?? responseStore?.get(responseId)?.response;
+  const storedRecord = responseStore?.get(responseId) ?? null;
+  const stored = storedResponses.get(responseId) ?? storedRecord?.response;
+  const conversationKey = responseConversationKeys.get(responseId) ?? storedRecord?.conversationKey ?? `response:${responseId}`;
   const request: ResponsesRequest = {
     model: typeof stored?.model === "string" ? stored.model : config.zai.defaultModel,
     input: "",
     store: false
   };
-  const response = responseObject(request, responseId, `msg_${randomUUID()}`, Math.floor(Date.now() / 1000), "cancelled", "", null);
+  const response = stored
+    ? cancelledResponseFromStored(stored, responseId)
+    : responseObject(request, responseId, `msg_${randomUUID()}`, Math.floor(Date.now() / 1000), "cancelled", "", null);
   storedResponses.set(responseId, response);
-  responseStore?.save(responseId, responseConversationKeys.get(responseId) ?? `response:${responseId}`, response);
-  return c.json(response, result.ok ? 200 : 404);
+  responseConversationKeys.set(responseId, conversationKey);
+  responseStore?.save(responseId, conversationKey, response);
+  return c.json(response, result.ok ? 200 : 404, responseIdHeaders(responseId));
 }
 
 function toChatRequest(request: ResponsesRequest, conversationKey: string): ChatCompletionRequest {
+  const enableThinking = request.zai?.enable_thinking ?? (wantsReasoningSummary(request) ? true : undefined);
+  const zaiOptions: NonNullable<ChatCompletionRequest["zai"]> = {
+    ...request.zai,
+    conversation_key: conversationKey
+  };
+  if (enableThinking !== undefined) {
+    zaiOptions.enable_thinking = enableThinking;
+  }
+
   const chatRequest: ChatCompletionRequest = {
     model: request.model || config.zai.defaultModel,
     messages: responsesInputToMessages(request.input, request.instructions),
@@ -187,10 +248,7 @@ function toChatRequest(request: ResponsesRequest, conversationKey: string): Chat
     stream_options: { include_usage: true },
     prompt_cache_key: request.prompt_cache_key ?? conversationKey,
     metadata: isRecord(request.metadata) ? request.metadata : null,
-    zai: {
-      ...request.zai,
-      conversation_key: conversationKey
-    }
+    zai: zaiOptions
   };
 
   if (typeof request.temperature === "number") chatRequest.temperature = request.temperature;
@@ -318,6 +376,19 @@ function flattenResponseText(value: unknown): string {
     return "";
   }
 
+  const type = typeof value.type === "string" ? value.type : "";
+  if ((type === "input_text" || type === "output_text" || type === "text") && typeof value.text === "string") {
+    return value.text;
+  }
+  if (type === "input_image" || type === "image_url") {
+    const imageUrl = responseImageUrl(value);
+    if (imageUrl) {
+      return `![image](${imageUrl})`;
+    }
+    const fileId = stringValue(value.file_id);
+    return fileId ? `[image_file: ${fileId}]` : "";
+  }
+
   if (typeof value.text === "string") {
     return value.text;
   }
@@ -333,38 +404,45 @@ function flattenResponseText(value: unknown): string {
   return "";
 }
 
+function responseImageUrl(value: Record<string, unknown>): string | null {
+  if (typeof value.image_url === "string" && value.image_url.trim()) {
+    return value.image_url.trim();
+  }
+  if (isRecord(value.image_url)) {
+    return stringValue(value.image_url.url);
+  }
+  return null;
+}
+
 async function collectResponseCompletion(
   upstream: ReadableStream<Uint8Array>
-): Promise<{ content: string; usage: OpenAIUsage | null }> {
+): Promise<{ content: string; reasoningContent: string; usage: OpenAIUsage | null; sawReasoning: boolean }> {
   let content = "";
+  let reasoningContent = "";
   let usage: OpenAIUsage | null = null;
+  let sawReasoning = false;
 
   for await (const event of parseSse(upstream)) {
-    const parsed = parseZaiEvent(event.data);
-    const upstreamError = getZaiError(parsed);
-    if (upstreamError) {
-      throw new Error(formatZaiError(upstreamError));
-    }
-    if (!parsed?.data) {
-      continue;
-    }
+    const parsed = normalizeZaiCompletionEvent(event.data);
 
-    const currentUsage = normalizeUsage(parsed.data.usage);
-    if (currentUsage) {
-      usage = currentUsage;
+    if (parsed.error) {
+      throw new Error(formatZaiError(parsed.error));
     }
-
-    const delta = parsed.data.delta_content;
-    if (delta && parsed.data.phase !== "thinking") {
-      content += delta;
+    if (parsed.usage) {
+      usage = parsed.usage;
     }
-
-    if (parsed.data.done || parsed.data.phase === "done") {
+    if (parsed.isReasoning) {
+      sawReasoning = sawReasoning || Boolean(parsed.delta);
+      reasoningContent += parsed.delta;
+    } else if (parsed.delta) {
+      content += parsed.delta;
+    }
+    if (parsed.done) {
       break;
     }
   }
 
-  return { content, usage };
+  return { content, reasoningContent, usage, sawReasoning };
 }
 
 function streamResponses(
@@ -379,11 +457,16 @@ function streamResponses(
 ): Response {
   const encoder = new TextEncoder();
   let sequenceNumber = 0;
+  const includeReasoning = wantsReasoningSummary(request);
+  const reasoningItemId = includeReasoning ? `rs_${randomUUID()}` : null;
+  const messageOutputIndex = includeReasoning ? 1 : 0;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let content = "";
+      let reasoningContent = "";
       let usage: OpenAIUsage | null = null;
+      let sawReasoning = false;
 
       const enqueue = (event: Record<string, unknown>) => {
         sequenceNumber += 1;
@@ -397,71 +480,107 @@ function streamResponses(
         response: responseObject(request, id, messageId, createdAt, "in_progress", "", null)
       });
       enqueue({
+        type: "response.in_progress",
+        response: responseObject(request, id, messageId, createdAt, "in_progress", "", null)
+      });
+      if (reasoningItemId) {
+        enqueue({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: reasoningOutputItem(reasoningItemId, "in_progress", null)
+        });
+      }
+      enqueue({
         type: "response.output_item.added",
-        output_index: 0,
+        output_index: messageOutputIndex,
         item: outputMessage(messageId, "in_progress", "")
       });
       enqueue({
         type: "response.content_part.added",
         item_id: messageId,
-        output_index: 0,
+        output_index: messageOutputIndex,
         content_index: 0,
         part: { type: "output_text", text: "", annotations: [] }
       });
 
       try {
         for await (const event of parseSse(upstream)) {
-          const parsed = parseZaiEvent(event.data);
-          const upstreamError = getZaiError(parsed);
-          if (upstreamError) {
-            throw new Error(formatZaiError(upstreamError));
-          }
-          if (!parsed?.data) {
-            continue;
-          }
+          const parsed = normalizeZaiCompletionEvent(event.data);
 
-          const currentUsage = normalizeUsage(parsed.data.usage);
-          if (currentUsage) {
-            usage = currentUsage;
+          if (parsed.error) {
+            throw new Error(formatZaiError(parsed.error));
           }
-
-          const delta = parsed.data.delta_content;
-          if (delta && parsed.data.phase !== "thinking") {
-            content += delta;
+          if (parsed.usage) {
+            usage = parsed.usage;
+          }
+          if (parsed.isReasoning) {
+            sawReasoning = sawReasoning || Boolean(parsed.delta);
+            reasoningContent += parsed.delta;
+          } else if (parsed.delta) {
+            content += parsed.delta;
             enqueue({
               type: "response.output_text.delta",
               item_id: messageId,
-              output_index: 0,
+              output_index: messageOutputIndex,
               content_index: 0,
-              delta
+              delta: parsed.delta
             });
           }
 
-          if (parsed.data.done || parsed.data.phase === "done") {
+          if (parsed.done) {
             break;
           }
         }
 
+        if (reasoningItemId) {
+          enqueue({
+            type: "response.output_item.done",
+            output_index: 0,
+            item: reasoningOutputItem(
+              reasoningItemId,
+              "completed",
+              safeReasoningSummary(request, reasoningContent, sawReasoning)
+            )
+          });
+        }
         enqueue({
           type: "response.output_text.done",
           item_id: messageId,
-          output_index: 0,
+          output_index: messageOutputIndex,
           content_index: 0,
           text: content
         });
         enqueue({
           type: "response.content_part.done",
           item_id: messageId,
-          output_index: 0,
+          output_index: messageOutputIndex,
           content_index: 0,
           part: { type: "output_text", text: content, annotations: [] }
         });
         enqueue({
           type: "response.output_item.done",
-          output_index: 0,
+          output_index: messageOutputIndex,
           item: outputMessage(messageId, "completed", content)
         });
-        const completed = responseObject(request, id, messageId, createdAt, "completed", content, usage);
+        const completed = responseObject(
+          request,
+          id,
+          messageId,
+          createdAt,
+          "completed",
+          content,
+          usage,
+          null,
+          responseOutputWithReasoning(
+            request,
+            messageId,
+            "completed",
+            content,
+            sawReasoning,
+            reasoningContent,
+            reasoningItemId
+          )
+        );
         rememberResponse(id, completed, conversationKey, responseStore);
         enqueue({
           type: "response.completed",
@@ -470,19 +589,57 @@ function streamResponses(
         controller.close();
       } catch (error) {
         if (isAbortError(error)) {
-          const cancelled = responseObject(request, id, messageId, createdAt, "cancelled", content, usage);
+          const cancelled = responseObject(
+            request,
+            id,
+            messageId,
+            createdAt,
+            "cancelled",
+            content,
+            usage,
+            null,
+            responseOutputWithReasoning(
+              request,
+              messageId,
+              "incomplete",
+              content,
+              sawReasoning,
+              reasoningContent,
+              reasoningItemId
+            )
+          );
           rememberResponse(id, cancelled, conversationKey, responseStore);
+          enqueueOpenTextFinalEvents(enqueue, messageId, content, "incomplete", messageOutputIndex);
           enqueue({ type: "response.completed", response: cancelled });
           controller.close();
           return;
         }
         const message = error instanceof Error ? error.message : String(error);
         logger.error("STREAM", "Responses SSE transform failed", message);
+        enqueueOpenTextFinalEvents(enqueue, messageId, content, "incomplete", messageOutputIndex);
         enqueue({ type: "error", code: "upstream_error", message });
-        const failed = responseObject(request, id, messageId, createdAt, "failed", content, usage, {
-          code: "upstream_error",
-          message
-        });
+        const failed = responseObject(
+          request,
+          id,
+          messageId,
+          createdAt,
+          "failed",
+          content,
+          usage,
+          {
+            code: "upstream_error",
+            message
+          },
+          responseOutputWithReasoning(
+            request,
+            messageId,
+            "incomplete",
+            content,
+            sawReasoning,
+            reasoningContent,
+            reasoningItemId
+          )
+        );
         rememberResponse(id, failed, conversationKey, responseStore);
         enqueue({
           type: "response.failed",
@@ -504,7 +661,8 @@ function streamResponses(
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      "X-Accel-Buffering": "no"
+      "X-Accel-Buffering": "no",
+      ...responseIdHeaders(id)
     }
   });
 }
@@ -539,7 +697,7 @@ function responseObject(
     output,
     parallel_tool_calls: request.parallel_tool_calls ?? false,
     previous_response_id: typeof request.previous_response_id === "string" ? request.previous_response_id : null,
-    reasoning: { effort: null, summary: null },
+    reasoning: responseReasoning(request),
     store: request.store ?? false,
     temperature: request.temperature ?? null,
     text: { format: { type: "text" } },
@@ -557,10 +715,29 @@ function responseObjectFromToolBridge(
   result: ToolBridgeResult,
   id: string,
   messageId: string,
-  createdAt: number
+  createdAt: number,
+  reasoningItemId: string | null = null
 ) {
   if (result.kind === "final") {
-    return responseObject(request, id, messageId, createdAt, "completed", result.content, result.usage);
+    return responseObject(
+      request,
+      id,
+      messageId,
+      createdAt,
+      "completed",
+      result.content,
+      result.usage,
+      null,
+      responseOutputWithReasoning(
+        request,
+        messageId,
+        "completed",
+        result.content,
+        Boolean(result.reasoningContent),
+        result.reasoningContent,
+        reasoningItemId
+      )
+    );
   }
   return responseObject(
     request,
@@ -587,6 +764,9 @@ function streamToolBridgeResponse(
 ): Response {
   const encoder = new TextEncoder();
   let sequenceNumber = 0;
+  const includeReasoning = result.kind === "final" && wantsReasoningSummary(request);
+  const reasoningItemId = includeReasoning ? `rs_${randomUUID()}` : null;
+  const messageOutputIndex = includeReasoning ? 1 : 0;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const enqueue = (event: Record<string, unknown>) => {
@@ -600,8 +780,12 @@ function streamToolBridgeResponse(
         type: "response.created",
         response: responseObject(request, id, messageId, createdAt, "in_progress", "", null)
       });
+      enqueue({
+        type: "response.in_progress",
+        response: responseObject(request, id, messageId, createdAt, "in_progress", "", null)
+      });
 
-      const completed = responseObjectFromToolBridge(request, result, id, messageId, createdAt);
+      const completed = responseObjectFromToolBridge(request, result, id, messageId, createdAt, reasoningItemId);
       if (result.kind === "tool_calls") {
         completed.output.forEach((item: Record<string, unknown>, index: number) => {
           const pending = { ...item, status: "in_progress", arguments: "" };
@@ -611,6 +795,7 @@ function streamToolBridgeResponse(
             enqueue({
               type: "response.function_call_arguments.delta",
               item_id: item.id,
+              call_id: item.call_id,
               output_index: index,
               content_index: 0,
               delta
@@ -619,6 +804,7 @@ function streamToolBridgeResponse(
           enqueue({
             type: "response.function_call_arguments.done",
             item_id: item.id,
+            call_id: item.call_id,
             output_index: index,
             content_index: 0,
             arguments: args
@@ -626,28 +812,58 @@ function streamToolBridgeResponse(
           enqueue({ type: "response.output_item.done", output_index: index, item });
         });
       } else {
+        if (reasoningItemId) {
+          enqueue({
+            type: "response.output_item.added",
+            output_index: 0,
+            item: reasoningOutputItem(reasoningItemId, "in_progress", null)
+          });
+          enqueue({
+            type: "response.output_item.done",
+            output_index: 0,
+            item: reasoningOutputItem(
+              reasoningItemId,
+              "completed",
+              safeReasoningSummary(request, result.reasoningContent, Boolean(result.reasoningContent))
+            )
+          });
+        }
         enqueue({
           type: "response.output_item.added",
-          output_index: 0,
+          output_index: messageOutputIndex,
           item: outputMessage(messageId, "in_progress", "")
+        });
+        enqueue({
+          type: "response.content_part.added",
+          item_id: messageId,
+          output_index: messageOutputIndex,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] }
         });
         enqueue({
           type: "response.output_text.delta",
           item_id: messageId,
-          output_index: 0,
+          output_index: messageOutputIndex,
           content_index: 0,
           delta: result.content
         });
         enqueue({
           type: "response.output_text.done",
           item_id: messageId,
-          output_index: 0,
+          output_index: messageOutputIndex,
           content_index: 0,
           text: result.content
         });
         enqueue({
+          type: "response.content_part.done",
+          item_id: messageId,
+          output_index: messageOutputIndex,
+          content_index: 0,
+          part: { type: "output_text", text: result.content, annotations: [] }
+        });
+        enqueue({
           type: "response.output_item.done",
-          output_index: 0,
+          output_index: messageOutputIndex,
           item: outputMessage(messageId, "completed", result.content)
         });
       }
@@ -669,7 +885,182 @@ function streamToolBridgeResponse(
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      "X-Accel-Buffering": "no"
+      "X-Accel-Buffering": "no",
+      ...responseIdHeaders(id)
+    }
+  });
+}
+
+function streamToolBridgeResponseLive(
+  zai: ZaiClient,
+  chatRequest: ChatCompletionRequest,
+  request: ResponsesRequest,
+  id: string,
+  messageId: string,
+  createdAt: number,
+  conversationKey: string,
+  active: ActiveRequestHandle,
+  responseStore?: ResponseRepository
+): Response {
+  const encoder = new TextEncoder();
+  let sequenceNumber = 0;
+  let content = "";
+  let textOpened = false;
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const enqueue = (event: Record<string, unknown>) => {
+        sequenceNumber += 1;
+        const type = typeof event.type === "string" ? event.type : "message";
+        const data = JSON.stringify({ response_id: id, ...event, sequence_number: sequenceNumber });
+        controller.enqueue(encoder.encode(`event: ${type}\ndata: ${data}\n\n`));
+      };
+      const openText = () => {
+        if (textOpened) {
+          return;
+        }
+        textOpened = true;
+        enqueue({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: outputMessage(messageId, "in_progress", "")
+        });
+        enqueue({
+          type: "response.content_part.added",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] }
+        });
+      };
+      const enqueueTextDelta = (delta: string) => {
+        if (!delta) {
+          return;
+        }
+        openText();
+        content += delta;
+        enqueue({
+          type: "response.output_text.delta",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          delta
+        });
+      };
+      const finishText = (status: "completed" | "incomplete") => {
+        openText();
+        enqueueOpenTextFinalEvents(enqueue, messageId, content, status, 0);
+      };
+
+      enqueue({
+        type: "response.created",
+        response: responseObject(request, id, messageId, createdAt, "in_progress", "", null)
+      });
+      enqueue({
+        type: "response.in_progress",
+        response: responseObject(request, id, messageId, createdAt, "in_progress", "", null)
+      });
+
+      try {
+        const result = await maybeRunToolBridge(zai, chatRequest, active.signal, {
+          onContentDelta: enqueueTextDelta
+        });
+
+        if (!result) {
+          finishText("completed");
+          const completed = responseObject(request, id, messageId, createdAt, "completed", content, null);
+          rememberResponse(id, completed, conversationKey, responseStore);
+          enqueue({ type: "response.completed", response: completed });
+          controller.close();
+          return;
+        }
+
+        if (result.kind === "tool_calls") {
+          result.toolCalls.forEach((call, index) => {
+            const item = outputFunctionCall(call);
+            const pending = { ...item, status: "in_progress", arguments: "" };
+            enqueue({ type: "response.output_item.added", output_index: index, item: pending });
+            for (const delta of chunkString(call.function.arguments, 4096)) {
+              enqueue({
+                type: "response.function_call_arguments.delta",
+                item_id: item.id,
+                call_id: item.call_id,
+                output_index: index,
+                content_index: 0,
+                delta
+              });
+            }
+            enqueue({
+              type: "response.function_call_arguments.done",
+              item_id: item.id,
+              call_id: item.call_id,
+              output_index: index,
+              content_index: 0,
+              arguments: call.function.arguments
+            });
+            enqueue({ type: "response.output_item.done", output_index: index, item });
+          });
+          const completed = responseObjectFromToolBridge(request, result, id, messageId, createdAt);
+          rememberResponse(id, completed, conversationKey, responseStore);
+          enqueue({ type: "response.completed", response: completed });
+          controller.close();
+          return;
+        }
+
+        if (!result.streamedContent) {
+          for (const delta of chunkString(result.content, 4096)) {
+            enqueueTextDelta(delta);
+          }
+        } else {
+          content = result.content || content;
+        }
+        finishText("completed");
+        const completed = responseObjectFromToolBridge(request, result, id, messageId, createdAt);
+        rememberResponse(id, completed, conversationKey, responseStore);
+        enqueue({ type: "response.completed", response: completed });
+        controller.close();
+      } catch (error) {
+        if (isAbortError(error)) {
+          if (textOpened || content) {
+            finishText("incomplete");
+          }
+          const cancelled = responseObject(request, id, messageId, createdAt, "cancelled", content, null);
+          rememberResponse(id, cancelled, conversationKey, responseStore);
+          enqueue({ type: "response.completed", response: cancelled });
+          controller.close();
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error("STREAM", "Responses tool bridge stream failed", message);
+        if (textOpened || content) {
+          finishText("incomplete");
+        }
+        enqueue({ type: "error", code: "upstream_error", message });
+        const failed = responseObject(request, id, messageId, createdAt, "failed", content, null, {
+          code: "upstream_error",
+          message
+        });
+        rememberResponse(id, failed, conversationKey, responseStore);
+        enqueue({ type: "response.failed", response: failed });
+        controller.close();
+      } finally {
+        active.complete();
+      }
+    },
+    cancel() {
+      cancelActiveRequest(id, "client_stream_cancelled");
+      active.complete();
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+      ...responseIdHeaders(id)
     }
   });
 }
@@ -704,6 +1095,66 @@ function outputMessage(id: string, status: "in_progress" | "completed" | "incomp
   };
 }
 
+function reasoningOutputItem(id: string, status: "in_progress" | "completed" | "incomplete", summary: string | null) {
+  return {
+    id,
+    type: "reasoning",
+    status,
+    summary: summary ? [{ type: "summary_text", text: summary }] : []
+  };
+}
+
+function responseOutputWithReasoning(
+  request: ResponsesRequest,
+  messageId: string,
+  messageStatus: "completed" | "incomplete",
+  content: string,
+  sawReasoning: boolean,
+  reasoningContent = "",
+  reasoningItemId: string | null = null
+): Array<Record<string, unknown>> | null {
+  if (!wantsReasoningSummary(request)) {
+    return null;
+  }
+  return [
+    reasoningOutputItem(
+      reasoningItemId ?? `rs_${randomUUID()}`,
+      "completed",
+      safeReasoningSummary(request, reasoningContent, sawReasoning)
+    ),
+    outputMessage(messageId, messageStatus, content)
+  ];
+}
+
+function wantsReasoningSummary(request: ResponsesRequest): boolean {
+  if (request.zai?.include_reasoning) {
+    return true;
+  }
+  if (!isRecord(request.reasoning)) {
+    return false;
+  }
+  const summary = stringValue(request.reasoning.summary);
+  return Boolean(summary && summary !== "none" && summary !== "false");
+}
+
+function safeReasoningSummary(request: ResponsesRequest, reasoningContent: string, sawReasoning: boolean): string {
+  const rawReasoning = reasoningContent.trim();
+  if (request.zai?.include_reasoning && rawReasoning) {
+    return rawReasoning;
+  }
+  return sawReasoning
+    ? "The upstream model produced reasoning tokens. Raw chain-of-thought was suppressed by the proxy."
+    : "No upstream reasoning tokens were observed.";
+}
+
+function responseReasoning(request: ResponsesRequest): Record<string, unknown> {
+  const reasoning = isRecord(request.reasoning) ? request.reasoning : {};
+  return {
+    effort: stringValue(reasoning.effort),
+    summary: stringValue(reasoning.summary)
+  };
+}
+
 function responseUsage(usage: OpenAIUsage | null) {
   if (!usage) {
     return null;
@@ -717,29 +1168,25 @@ function responseUsage(usage: OpenAIUsage | null) {
   };
 }
 
-function normalizeUsage(value: unknown): OpenAIUsage | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  const promptTokens = numberValue(value.prompt_tokens);
-  const completionTokens = numberValue(value.completion_tokens);
-  const totalTokens = numberValue(value.total_tokens);
-  if (promptTokens === null && completionTokens === null && totalTokens === null) {
-    return null;
-  }
+function cancelledResponseFromStored(stored: Record<string, unknown>, responseId: string): Record<string, unknown> {
   return {
-    prompt_tokens: promptTokens ?? 0,
-    completion_tokens: completionTokens ?? 0,
-    total_tokens: totalTokens ?? (promptTokens ?? 0) + (completionTokens ?? 0),
-    ...(isRecord(value.prompt_tokens_details) ? { prompt_tokens_details: value.prompt_tokens_details } : {}),
-    ...(isRecord(value.completion_tokens_details)
-      ? { completion_tokens_details: value.completion_tokens_details }
-      : {})
+    ...stored,
+    id: typeof stored.id === "string" ? stored.id : responseId,
+    object: "response",
+    status: "cancelled",
+    error: null,
+    incomplete_details: { reason: "cancelled" },
+    output: Array.isArray(stored.output) ? stored.output.map(markOutputIncomplete) : [],
+    usage: stored.usage ?? null,
+    created_at: typeof stored.created_at === "number" ? stored.created_at : Math.floor(Date.now() / 1000)
   };
 }
 
-function numberValue(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+function markOutputIncomplete(item: unknown): unknown {
+  if (!isRecord(item)) {
+    return item;
+  }
+  return { ...item, status: "incomplete" };
 }
 
 function responseInputToolCall(item: Record<string, unknown>): OpenAIToolCall | null {
@@ -789,26 +1236,56 @@ function responseConversationKey(
   request: ResponsesRequest,
   responseId: string,
   responseStore?: ResponseRepository
-): string {
+): { ok: true; conversationKey: string } | { ok: false; previousResponseId: string } {
   if (typeof request.prompt_cache_key === "string" && request.prompt_cache_key.trim()) {
-    return `prompt:${request.prompt_cache_key.trim()}`;
+    return { ok: true, conversationKey: `prompt:${request.prompt_cache_key.trim()}` };
   }
   if (typeof request.previous_response_id === "string" && request.previous_response_id.trim()) {
-    return (
+    const conversationKey =
       responseConversationKeys.get(request.previous_response_id) ??
-      responseStore?.getConversationKey(request.previous_response_id) ??
-      `response:${request.previous_response_id}`
-    );
+      responseStore?.getConversationKey(request.previous_response_id);
+    if (!conversationKey) {
+      return { ok: false, previousResponseId: request.previous_response_id };
+    }
+    return { ok: true, conversationKey };
   }
   const metadata = isRecord(request.metadata) ? request.metadata : null;
   const metadataKey = metadataString(metadata, ["conversation_id", "thread_id", "session_id", "chat_id"]);
   if (metadataKey) {
-    return `metadata:${metadataKey}`;
+    return { ok: true, conversationKey: `metadata:${metadataKey}` };
   }
   if (typeof request.user === "string" && request.user.trim()) {
-    return `user:${request.user.trim()}`;
+    return { ok: true, conversationKey: `user:${request.user.trim()}` };
   }
-  return `response:${responseId}`;
+  return { ok: true, conversationKey: `response:${responseId}` };
+}
+
+function enqueueOpenTextFinalEvents(
+  enqueue: (event: Record<string, unknown>) => void,
+  messageId: string,
+  content: string,
+  status: "completed" | "incomplete",
+  outputIndex = 0
+): void {
+  enqueue({
+    type: "response.output_text.done",
+    item_id: messageId,
+    output_index: outputIndex,
+    content_index: 0,
+    text: content
+  });
+  enqueue({
+    type: "response.content_part.done",
+    item_id: messageId,
+    output_index: outputIndex,
+    content_index: 0,
+    part: { type: "output_text", text: content, annotations: [] }
+  });
+  enqueue({
+    type: "response.output_item.done",
+    output_index: outputIndex,
+    item: outputMessage(messageId, status, content)
+  });
 }
 
 function rememberResponse(
@@ -840,4 +1317,11 @@ function metadataString(metadata: Record<string, unknown> | null, keys: string[]
     }
   }
   return null;
+}
+
+function responseIdHeaders(id: string): Record<string, string> {
+  return {
+    "X-Request-Id": id,
+    "X-Proxy-Response-Id": id
+  };
 }

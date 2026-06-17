@@ -3,7 +3,6 @@ import { logger } from "../lib/logger.js";
 import type { ZaiAccount } from "../types/zai.js";
 
 const LIMIT_COOLDOWN_MS = 60 * 1000;
-const TRANSIENT_COOLDOWN_MS = 60 * 1000;
 
 export class AccountPool {
   constructor(private readonly accounts: AccountRepository) {}
@@ -47,8 +46,7 @@ export class AccountPool {
       return;
     }
 
-    logger.warn("AUTH", `Temporary cooldown for ${maskEmail(account.email)}`, message);
-    this.accounts.markLimited(account.id, message, TRANSIENT_COOLDOWN_MS);
+    logger.warn("AUTH", `Keeping ${maskEmail(account.email)} active after upstream failure`, message);
   }
 }
 

@@ -24,7 +24,16 @@ type ToolResult = {
   error?: string;
 };
 
-const DEFAULT_IGNORES = new Set([".git", "node_modules", "dist", "runtime", ".cache"]);
+const DEFAULT_IGNORES = new Set([".git", "node_modules", "dist", "runtime", "data", ".cache"]);
+const BLOCKED_DIR_NAMES = new Set([
+  ".ssh",
+  ".gnupg",
+  ".config",
+  ".local",
+  ".codex",
+  "data",
+  "runtime"
+]);
 const BLOCKED_FILE_PATTERNS = [
   /^\.env(?:\.|$)/,
   /^master\.key$/,
@@ -32,7 +41,7 @@ const BLOCKED_FILE_PATTERNS = [
   /\.(?:pem|p12|pfx|key)$/
 ];
 
-export const PROXY_TOOL_SPECS: ToolSpec[] = [
+const BASE_PROXY_TOOL_SPECS: ToolSpec[] = [
   {
     name: "list_directory",
     description: "List files and directories under the configured project root.",
@@ -217,6 +226,10 @@ export const PROXY_TOOL_SPECS: ToolSpec[] = [
   }
 ];
 
+export const PROXY_TOOL_SPECS: ToolSpec[] = config.tools.allowCommands
+  ? BASE_PROXY_TOOL_SPECS
+  : BASE_PROXY_TOOL_SPECS.filter((tool) => tool.name !== "run_command");
+
 export async function executeProxyToolCall(call: OpenAIToolCall): Promise<string> {
   const args = parseArguments(call);
   let result: ToolResult;
@@ -254,6 +267,9 @@ export async function executeProxyToolCall(call: OpenAIToolCall): Promise<string
         result = statPath(args);
         break;
       case "run_command":
+        if (!config.tools.allowCommands) {
+          throw new Error("run_command is disabled. Set PROXY_TOOLS_ALLOW_COMMANDS=true to enable it explicitly.");
+        }
         result = await runCommand(args);
         break;
       default:
@@ -444,7 +460,7 @@ async function runCommand(args: Record<string, unknown>): Promise<ToolResult> {
       cwd: cwd.absolute,
       shell,
       windowsHide: true,
-      env: process.env
+      env: commandEnvironment()
     });
     let stdout = "";
     let stderr = "";
@@ -492,8 +508,8 @@ async function runCommand(args: Record<string, unknown>): Promise<ToolResult> {
           signal,
           timed_out: timedOut,
           ms: Date.now() - started,
-          stdout,
-          stderr
+          stdout: redactSensitiveOutput(stdout),
+          stderr: redactSensitiveOutput(stderr)
         },
         ...(timedOut ? { error: `Command timed out after ${timeoutMs}ms` } : code === 0 ? {} : { error: `Command exited with ${code}` })
       });
@@ -603,6 +619,9 @@ function resolveToolPath(input: string, mode: "read" | "write") {
   const realExisting = realpathSync(existingPath);
   assertInsideRoot(root, realExisting);
   if (existsSync(absolute)) {
+    if (lstatSync(absolute).isSymbolicLink()) {
+      throw new Error(`${mode} denied for symbolic link: ${relative(root, absolute)}`);
+    }
     assertInsideRoot(root, realpathSync(absolute));
   } else {
     assertInsideRoot(root, resolve(realExisting, relative(existingPath, absolute)));
@@ -634,7 +653,7 @@ function assertInsideRoot(root: string, path: string): void {
 
 function isBlockedPath(path: string): boolean {
   const parts = path.split(/[\\/]+/);
-  if (parts.some((part) => [".ssh", ".gnupg", ".config"].includes(part))) return true;
+  if (parts.some((part) => BLOCKED_DIR_NAMES.has(part))) return true;
   const basename = parts.at(-1) ?? "";
   return BLOCKED_FILE_PATTERNS.some((pattern) => pattern.test(basename));
 }
@@ -706,6 +725,39 @@ function assertCommandAllowed(command: string): void {
   if (/(?:^|\s)rm\s+-[^;&|]*r[^;&|]*f[^;&|]*(?:\/|\*)/.test(normalized)) {
     throw new Error("Refusing to run broad recursive deletion");
   }
+  if (/\b(?:env|printenv|set)\b/.test(normalized)) {
+    throw new Error("Refusing to dump process environment");
+  }
+}
+
+function commandEnvironment(): NodeJS.ProcessEnv {
+  const allowed: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR"]) {
+    const value = process.env[key];
+    if (value) {
+      allowed[key] = value;
+    }
+  }
+  allowed.ZAI_PROXY_TOOL_ROOT = proxyToolsRoot();
+  return allowed;
+}
+
+function redactSensitiveOutput(value: string): string {
+  let redacted = value;
+  const explicitSecrets = [
+    config.proxyApiKey,
+    config.envMasterKey,
+    process.env.PROXY_API_KEY,
+    process.env.GLM_PROXY_MASTER_KEY
+  ].filter((item): item is string => Boolean(item && item.length >= 6));
+
+  for (const secret of explicitSecrets) {
+    redacted = redacted.split(secret).join("[redacted]");
+  }
+
+  return redacted
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{12,}/g, "Bearer [redacted]")
+    .replace(/(api[_-]?key|token|secret|password)=([^\s]+)/gi, "$1=[redacted]");
 }
 
 function trimOutput(value: string, maxChars: number): string {

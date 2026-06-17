@@ -2,7 +2,9 @@ export type OpenAIRole = "system" | "developer" | "user" | "assistant" | "tool";
 
 export type OpenAIContentPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string; detail?: string } };
+  | { type: "image_url"; image_url: { url: string; detail?: string } }
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url?: string; file_id?: string; detail?: string };
 
 export type OpenAIMessage = {
   role: OpenAIRole;
@@ -72,6 +74,7 @@ export type ChatCompletionRequest = {
   stream_options?: { include_usage?: boolean; include_reasoning?: boolean };
   zai?: {
     enable_thinking?: boolean;
+    web_search?: boolean;
     auto_web_search?: boolean;
     captcha_verify_param?: string;
     include_reasoning?: boolean;
@@ -79,6 +82,12 @@ export type ChatCompletionRequest = {
     force_new_chat?: boolean;
     fresh_chat_retry?: boolean;
     proxy_tools?: boolean;
+    vision?: boolean;
+    reasoning_effort?: string;
+    flags?: string[];
+    mcp_servers?: unknown[];
+    frontend_captcha?: boolean;
+    agent_mode?: boolean;
   };
 };
 
@@ -92,6 +101,12 @@ export type OpenAIModel = {
   description?: string;
   family?: string;
   capabilities?: Record<string, boolean>;
+  aliases?: string[];
+  upstream_id?: string;
+  context_length?: number;
+  max_tokens?: number;
+  source?: "local" | "upstream" | "experimental";
+  experimental?: boolean;
 };
 
 export type OpenAIUsage = {

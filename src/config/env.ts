@@ -23,25 +23,32 @@ const envSchema = z.object({
   PROXY_API_KEY: z.string().optional().default(""),
   PROXY_REQUIRE_API_KEY: booleanEnv(false),
   ZAI_BASE_URL: z.string().url().default("https://chat.z.ai"),
-  ZAI_FE_VERSION: z.string().default("prod-fe-1.1.38"),
+  ZAI_FE_VERSION: z.string().default("prod-fe-1.1.52"),
   ZAI_REGION: z.string().default("overseas"),
   ZAI_LANGUAGE: z.string().default("pt-BR"),
   ZAI_ACCEPT_LANGUAGE: z.string().default("en-US"),
   ZAI_TIMEZONE: z.string().default("America/Sao_Paulo"),
-  ZAI_DEFAULT_MODEL: z.string().default("GLM-5.1"),
+  ZAI_DEFAULT_MODEL: z.string().default("GLM-5.2"),
+  ZAI_ALLOW_UNLISTED_MODELS: booleanEnv(false),
+  ZAI_EXPERIMENTAL_MODELS: z.string().optional().default(""),
+  ZAI_MAX_INLINE_IMAGE_BYTES: z.coerce.number().int().positive().default(2 * 1024 * 1024),
   ZAI_HEALTH_CACHE_TTL_MS: z.coerce.number().int().positive().default(30000),
   ZAI_MODELS_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000),
   ZAI_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   DATA_DIR: z.string().default("./data"),
   RUNTIME_DIR: z.string().default("./runtime"),
+  FILE_STORE_DIR: z.string().default("./data/files"),
   DATABASE_PATH: z.string().default("./data/proxy.sqlite"),
   MASTER_KEY_PATH: z.string().default("./data/master.key"),
   CAPTCHA_HEADLESS: booleanEnv(true),
   CAPTCHA_KEEP_BROWSER_OPEN: booleanEnv(true),
   CAPTCHA_TIMEOUT_MS: z.coerce.number().int().positive().default(180000),
   CAPTCHA_IDLE_TTL_MS: z.coerce.number().int().positive().default(600000),
+  BROWSER_EXECUTABLE_PATH: z.string().optional().default(""),
+  BROWSER_CHANNEL: z.string().optional().default(""),
   PROXY_NATIVE_TOOLS: booleanEnv(true),
   PROXY_NATIVE_TOOLS_AUTO: booleanEnv(false),
+  PROXY_TOOLS_ALLOW_COMMANDS: booleanEnv(false),
   PROXY_TOOLS_ROOT: z.string().default("."),
   PROXY_TOOLS_MAX_FILE_BYTES: z.coerce.number().int().positive().default(1024 * 1024),
   PROXY_TOOLS_MAX_WRITE_BYTES: z.coerce.number().int().positive().default(1024 * 1024),
@@ -69,12 +76,16 @@ export const config = {
     acceptLanguage: parsed.ZAI_ACCEPT_LANGUAGE,
     timezone: parsed.ZAI_TIMEZONE,
     defaultModel: parsed.ZAI_DEFAULT_MODEL,
+    allowUnlistedModels: parsed.ZAI_ALLOW_UNLISTED_MODELS,
+    experimentalModels: parseCsv(parsed.ZAI_EXPERIMENTAL_MODELS),
+    maxInlineImageBytes: parsed.ZAI_MAX_INLINE_IMAGE_BYTES,
     healthCacheTtlMs: parsed.ZAI_HEALTH_CACHE_TTL_MS,
     modelsCacheTtlMs: parsed.ZAI_MODELS_CACHE_TTL_MS,
     fetchTimeoutMs: parsed.ZAI_FETCH_TIMEOUT_MS
   },
   dataDir: ensureDir(resolvePath(parsed.DATA_DIR)),
   runtimeDir: ensureDir(resolvePath(parsed.RUNTIME_DIR)),
+  fileStoreDir: ensureDir(resolvePath(parsed.FILE_STORE_DIR)),
   databasePath: ensureParentDir(resolvePath(parsed.DATABASE_PATH)),
   masterKeyPath: ensureParentDir(resolvePath(parsed.MASTER_KEY_PATH)),
   captcha: {
@@ -83,9 +94,14 @@ export const config = {
     timeoutMs: parsed.CAPTCHA_TIMEOUT_MS,
     idleTtlMs: parsed.CAPTCHA_IDLE_TTL_MS
   },
+  browser: {
+    executablePath: parsed.BROWSER_EXECUTABLE_PATH.trim(),
+    channel: parsed.BROWSER_CHANNEL.trim()
+  },
   tools: {
     nativeEnabled: parsed.PROXY_NATIVE_TOOLS,
     nativeAuto: parsed.PROXY_NATIVE_TOOLS_AUTO,
+    allowCommands: parsed.PROXY_TOOLS_ALLOW_COMMANDS,
     root: ensureDir(resolvePath(parsed.PROXY_TOOLS_ROOT)),
     maxFileBytes: parsed.PROXY_TOOLS_MAX_FILE_BYTES,
     maxWriteBytes: parsed.PROXY_TOOLS_MAX_WRITE_BYTES,
@@ -101,6 +117,13 @@ function readPackageVersion(): string {
   } catch {
     return "0.0.0";
   }
+}
+
+function parseCsv(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 export function loadOrCreateMasterSecret(): string {

@@ -96,7 +96,25 @@ O updater compara a branch `main` de `https://github.com/AnThophicous/zaiproxy` 
 
 ## Tool calls
 
-As tools nativas da Z.ai ficam desligadas no payload interno: o proxy nao envia `tool_selector_h`, `mcp_servers` ou definicoes OpenAI diretamente para o upstream.
+As definicoes OpenAI `tools` continuam sendo tratadas pelo bridge local do proxy. O payload interno da Z.ai agora usa o envelope web `general_agent` com `tool_selector_h` oculto, mas o proxy nao converte automaticamente `tools` OpenAI para MCP upstream.
+
+Para testar MCP nativo da Z.ai, envie descritores compativeis diretamente em `zai.mcp_servers`. Eles sao repassados no payload upstream sem executar nada localmente:
+
+```json
+{
+  "model": "GLM-5.2",
+  "messages": [{ "role": "user", "content": "Use o servidor MCP configurado se fizer sentido." }],
+  "zai": {
+    "mcp_servers": [
+      {
+        "name": "example",
+        "type": "stdio",
+        "command": "example-mcp"
+      }
+    ]
+  }
+}
+```
 
 Quando um cliente como Zed ou OpenCode envia `tools`, o proxy injeta um contrato de tool-call no prompt da Z.ai, valida o JSON gerado e devolve `tool_calls` no formato Chat Completions:
 
@@ -148,8 +166,8 @@ Exemplo em `~/.config/zed/settings.json`:
         "api_url": "http://127.0.0.1:3000/v1",
         "available_models": [
           {
-            "name": "GLM-5.1",
-            "display_name": "GLM 5.1",
+            "name": "GLM-5.2",
+            "display_name": "GLM 5.2",
             "max_tokens": 200000,
             "max_output_tokens": 32000,
             "max_completion_tokens": 32000,
@@ -169,7 +187,7 @@ Exemplo em `~/.config/zed/settings.json`:
   "agent": {
     "default_model": {
       "provider": "openai_compatible",
-      "model": "GLM-5.1"
+      "model": "GLM-5.2"
     }
   }
 }
@@ -187,21 +205,21 @@ const client = new OpenAI({
 });
 
 const chat = await client.chat.completions.create({
-  model: "GLM-5.1",
+  model: "GLM-5.2",
   prompt_cache_key: "zed-workspace-main",
   parallel_tool_calls: true,
   messages: [{ role: "user", content: "Responda apenas: ok" }]
 });
 
 const response = await client.responses.create({
-  model: "GLM-5.1",
+  model: "GLM-5.2",
   input: "Responda apenas: ok",
   prompt_cache_key: "codex-session-main",
   parallel_tool_calls: true
 });
 ```
 
-Modelos com prefixo de provider tambem funcionam no request, por exemplo `z.ai/GLM-5.1`; o proxy remove o prefixo antes de chamar o Z.ai e mantem o formato OpenAI na resposta.
+Modelos com prefixo de provider tambem funcionam no request, por exemplo `z.ai/GLM-5.2`; o proxy remove o prefixo antes de chamar o Z.ai e mantem o formato OpenAI na resposta.
 
 ## OpenCode
 
@@ -215,7 +233,7 @@ Config minima esperada:
 
 ```jsonc
 {
-  "model": "z.ai/GLM-5.1",
+  "model": "z.ai/GLM-5.2",
   "small_model": "z.ai/GLM-5-Turbo",
   "provider": {
       "z.ai": {
@@ -225,7 +243,7 @@ Config minima esperada:
           "baseURL": "http://127.0.0.1:3000/v1"
         },
         "models": {
-        "GLM-5.1": { "name": "GLM-5.1" },
+        "GLM-5.2": { "name": "GLM-5.2" },
         "GLM-5-Turbo": { "name": "GLM-5-Turbo" }
       }
     }
@@ -239,7 +257,7 @@ Qualquer cliente que permita endpoint OpenAI-compatible deve usar:
 
 ```text
 base_url: http://127.0.0.1:3000/v1
-model: GLM-5.1
+model: GLM-5.2
 api_key: local
 ```
 
@@ -252,7 +270,7 @@ PROXY_API_KEY=
 PROXY_REQUIRE_API_KEY=false
 
 ZAI_BASE_URL=https://chat.z.ai
-ZAI_DEFAULT_MODEL=GLM-5.1
+ZAI_DEFAULT_MODEL=GLM-5.2
 ZAI_HEALTH_CACHE_TTL_MS=30000
 ZAI_MODELS_CACHE_TTL_MS=300000
 ZAI_FETCH_TIMEOUT_MS=10000
@@ -272,7 +290,7 @@ PROXY_TOOLS_MAX_ROUNDS=6
 ZAI_PROXY_REMOTE_URL=https://github.com/AnThophicous/zaiproxy.git
 ZAI_PROXY_REMOTE_BRANCH=main
 ZAI_PROXY_BASE_URL=http://127.0.0.1:3000/v1
-ZAI_PROXY_MODEL=GLM-5.1
+ZAI_PROXY_MODEL=GLM-5.2
 ZAI_PROXY_SMALL_MODEL=GLM-5-Turbo
 ```
 

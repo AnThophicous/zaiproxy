@@ -5,11 +5,11 @@ import { z } from "zod";
 import type { ZaiClient } from "../services/zai-client.js";
 import { config } from "../config/env.js";
 import { openAIError } from "../lib/openai-error.js";
-import { upstreamErrorCode, upstreamStatus } from "../lib/http-status.js";
+import { upstreamErrorCode, upstreamErrorType, upstreamStatus } from "../lib/http-status.js";
 import { encodeSse, parseSse } from "../lib/sse.js";
 import { logger } from "../lib/logger.js";
 import type { ChatCompletionRequest, OpenAIUsage } from "../types/openai.js";
-import { collectZaiCompletion, normalizeUsage } from "../services/completion-collector.js";
+import { collectZaiCompletion } from "../services/completion-collector.js";
 import {
   cancelActiveRequest,
   createActiveRequest,
@@ -18,16 +18,17 @@ import {
 } from "../services/request-registry.js";
 import {
   formatZaiError,
-  getZaiError,
+  normalizeZaiCompletionEvent,
   openAiChunk,
   openAiCompletion,
-  openAiUsageChunk,
-  parseZaiEvent
+  openAiUsageChunk
 } from "../services/openai-transform.js";
 import {
   maybeRunToolBridge,
+  streamToolBridge,
   streamToolBridgeResult,
-  toolBridgeCompletion
+  toolBridgeCompletion,
+  usesToolBridge
 } from "../services/tool-bridge.js";
 
 const chatRequestSchema = z
@@ -126,6 +127,13 @@ async function handleChatCompletion(c: Context, zai: ZaiClient) {
       prompt_cache_key: request.prompt_cache_key ?? request.zai?.conversation_key ?? null
     });
     try {
+      if (request.stream && usesToolBridge(request)) {
+        return withResponseId(
+          streamToolBridge(zai, request, completionId, active.signal, active.complete),
+          completionId
+        );
+      }
+
       const toolResult = await maybeRunToolBridge(zai, request, active.signal);
       if (toolResult) {
         if (request.stream) {
@@ -152,7 +160,7 @@ async function handleChatCompletion(c: Context, zai: ZaiClient) {
       const message = error instanceof Error ? error.message : String(error);
       logger.error("HTTP", "Chat completion failed", message);
       const status = upstreamStatus(message);
-      const response = openAIError(message, status, upstreamErrorCode(status));
+      const response = openAIError(message, status, upstreamErrorCode(status), upstreamErrorType(status));
       return c.json(response.body, response.status);
     }
 }
@@ -193,7 +201,7 @@ async function handleTextCompletion(c: Context, zai: ZaiClient) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error("HTTP", "Text completion failed", message);
     const status = upstreamStatus(message);
-    const response = openAIError(message, status, upstreamErrorCode(status));
+    const response = openAIError(message, status, upstreamErrorCode(status), upstreamErrorType(status));
     return c.json(response.body, response.status);
   }
 }
@@ -217,33 +225,26 @@ function streamOpenAI(
 
       try {
         for await (const event of parseSse(upstream)) {
-          const parsed = parseZaiEvent(event.data);
-          const upstreamError = getZaiError(parsed);
-          if (upstreamError) {
-            throw new Error(formatZaiError(upstreamError));
-          }
-          if (!parsed?.data) {
-            continue;
-          }
+          const parsed = normalizeZaiCompletionEvent(event.data);
 
-          const currentUsage = normalizeUsage(parsed.data.usage);
-          if (currentUsage) {
-            usage = currentUsage;
+          if (parsed.error) {
+            throw new Error(formatZaiError(parsed.error));
           }
-
-          const delta = parsed.data.delta_content;
-          if (delta) {
-            if (parsed.data.phase === "thinking") {
+          if (parsed.usage) {
+            usage = parsed.usage;
+          }
+          if (parsed.delta) {
+            if (parsed.isReasoning) {
               if (!shouldIncludeReasoning(request)) {
                 continue;
               }
-              controller.enqueue(encodeSse(openAiChunk(id, model, { reasoning_content: delta })));
+              controller.enqueue(encodeSse(openAiChunk(id, model, { reasoning_content: parsed.delta })));
             } else {
-              controller.enqueue(encodeSse(openAiChunk(id, model, { content: delta })));
+              controller.enqueue(encodeSse(openAiChunk(id, model, { content: parsed.delta })));
             }
           }
 
-          if (parsed.data.done || parsed.data.phase === "done") {
+          if (parsed.done) {
             break;
           }
         }
@@ -269,8 +270,9 @@ function streamOpenAI(
           closeWithDone(controller);
           return;
         }
-        logger.error("STREAM", "SSE transform failed", error);
-        controller.error(error);
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error("STREAM", "SSE transform failed", message);
+        enqueueChatStreamError(controller, id, model, message);
       } finally {
         active?.complete();
       }
@@ -308,22 +310,18 @@ function streamTextCompletion(
       let usage: OpenAIUsage | null = null;
       try {
         for await (const event of parseSse(upstream)) {
-          const parsed = parseZaiEvent(event.data);
-          const upstreamError = getZaiError(parsed);
-          if (upstreamError) {
-            throw new Error(formatZaiError(upstreamError));
+          const parsed = normalizeZaiCompletionEvent(event.data);
+
+          if (parsed.error) {
+            throw new Error(formatZaiError(parsed.error));
           }
-          if (!parsed?.data) continue;
+          if (parsed.usage) usage = parsed.usage;
 
-          const currentUsage = normalizeUsage(parsed.data.usage);
-          if (currentUsage) usage = currentUsage;
-
-          const delta = parsed.data.delta_content;
-          if (delta && parsed.data.phase !== "thinking") {
-            controller.enqueue(encodeSse(textCompletionChunk(request, id, delta)));
+          if (parsed.delta && !parsed.isReasoning) {
+            controller.enqueue(encodeSse(textCompletionChunk(request, id, parsed.delta)));
           }
 
-          if (parsed.data.done || parsed.data.phase === "done") break;
+          if (parsed.done) break;
         }
 
         controller.enqueue(encodeSse(textCompletionChunk(request, id, "", "stop")));
@@ -338,8 +336,9 @@ function streamTextCompletion(
           closeWithDone(controller);
           return;
         }
-        logger.error("STREAM", "Text completion SSE transform failed", error);
-        controller.error(error);
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error("STREAM", "Text completion SSE transform failed", message);
+        enqueueTextStreamError(controller, request, id, message);
       } finally {
         active.complete();
       }
@@ -501,6 +500,36 @@ function closeWithDone(controller: ReadableStreamDefaultController<Uint8Array>):
   } catch {
     // Already closed.
   }
+}
+
+function enqueueChatStreamError(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  id: string,
+  model: string,
+  message: string
+): void {
+  try {
+    controller.enqueue(encodeSse(openAiChunk(id, model, {}, "stop")));
+    controller.enqueue(encodeSse({ ...openAIError(message, 502, "upstream_error").body, id }));
+  } catch {
+    // The client may already have closed the socket.
+  }
+  closeWithDone(controller);
+}
+
+function enqueueTextStreamError(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  request: TextCompletionRequest,
+  id: string,
+  message: string
+): void {
+  try {
+    controller.enqueue(encodeSse(textCompletionChunk(request, id, "", "stop")));
+    controller.enqueue(encodeSse({ ...openAIError(message, 502, "upstream_error").body, id }));
+  } catch {
+    // The client may already have closed the socket.
+  }
+  closeWithDone(controller);
 }
 
 function responseIdHeaders(id: string): Record<string, string> {

@@ -1,3 +1,37 @@
+export type ZaiBrowserFingerprint = {
+  version: 1;
+  capturedAt: string;
+  userAgent: string;
+  language: string;
+  languages: string[];
+  timezone: string;
+  timezoneOffset: number;
+  cookieEnabled: boolean;
+  screen: {
+    width: number;
+    height: number;
+    availWidth: number;
+    availHeight: number;
+    colorDepth: number;
+    pixelDepth: number;
+  };
+  viewport: {
+    width: number;
+    height: number;
+  };
+  pixelRatio: number;
+  isTouch: boolean;
+  maxTouchPoints: number;
+  platform: string;
+  vendor: string;
+  browserName: string;
+  osName: string;
+  hardwareConcurrency: number | null;
+  deviceMemory: number | null;
+  sessionStorage: Record<string, string>;
+  requestHeaders: Record<string, string>;
+};
+
 export type ZaiAccount = {
   id: string;
   provider: "zai";
@@ -6,6 +40,7 @@ export type ZaiAccount = {
   token: string;
   cookies: unknown[];
   localStorage: Record<string, string>;
+  browserFingerprint: ZaiBrowserFingerprint | null;
   browserProfilePath: string;
   userAgent: string;
   status: "active" | "invalid" | "disabled" | "limited";

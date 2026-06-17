@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { config } from "../config/env.js";
 import { encodeSse } from "../lib/sse.js";
 import { logger } from "../lib/logger.js";
+import { openAIError } from "../lib/openai-error.js";
 import type {
   ChatCompletionRequest,
   OpenAIMessage,
@@ -21,12 +22,18 @@ import {
 import { executeProxyToolCall, PROXY_TOOL_SPECS, proxyToolsRoot } from "./proxy-tools.js";
 import { flattenMessageContent, openAiChunk, openAiUsageChunk } from "./openai-transform.js";
 
+type ToolBridgeStreamHooks = {
+  onContentDelta?: (delta: string) => void;
+  onReasoningDelta?: (delta: string) => void;
+};
+
 export type ToolBridgeResult =
   | {
       kind: "final";
       content: string;
       reasoningContent: string;
       usage: OpenAIUsage | null;
+      streamedContent?: boolean;
     }
   | {
       kind: "tool_calls";
@@ -44,7 +51,8 @@ const TOOL_RETRY_LIMIT = 1;
 export async function maybeRunToolBridge(
   zai: ZaiClient,
   request: ChatCompletionRequest,
-  signal: AbortSignal
+  signal: AbortSignal,
+  hooks: ToolBridgeStreamHooks = {}
 ): Promise<ToolBridgeResult | null> {
   if (!toolChoiceAllowsTools(request.tool_choice)) {
     return null;
@@ -54,10 +62,11 @@ export async function maybeRunToolBridge(
   if (clientTools.length > 0) {
     logger.info("TOOLS", "OpenAI client tools detected", {
       count: clientTools.length,
+      tool_names: clientTools.slice(0, 20).map((tool) => tool.name),
       parallel_tool_calls: request.parallel_tool_calls ?? null,
       prompt_cache_key: request.prompt_cache_key ?? request.zai?.conversation_key ?? null
     });
-    return runClientToolSelection(zai, request, clientTools, signal);
+    return runClientToolSelection(zai, request, clientTools, signal, hooks);
   }
 
   const shouldUseNativeTools =
@@ -71,7 +80,17 @@ export async function maybeRunToolBridge(
     count: PROXY_TOOL_SPECS.length,
     auto: config.tools.nativeAuto
   });
-  return runProxyToolLoop(zai, request, signal);
+  return runProxyToolLoop(zai, request, signal, hooks);
+}
+
+export function usesToolBridge(request: ChatCompletionRequest): boolean {
+  if (!toolChoiceAllowsTools(request.tool_choice)) {
+    return false;
+  }
+  if (functionToolsFromUnknown(request.tools).length > 0) {
+    return true;
+  }
+  return config.tools.nativeEnabled && (config.tools.nativeAuto || request.zai?.proxy_tools === true);
 }
 
 export function toolBridgeCompletion(request: ChatCompletionRequest, result: ToolBridgeResult, id = `chatcmpl-${randomUUID()}`) {
@@ -137,73 +156,7 @@ export function streamToolBridgeResult(
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       try {
-        controller.enqueue(encodeSse(openAiChunk(id, request.model, { role: "assistant" })));
-
-        if (result.kind === "tool_calls") {
-          result.toolCalls.forEach((toolCall, index) => {
-            const args = toolCall.function.arguments;
-            controller.enqueue(
-              encodeSse(
-                openAiChunk(id, request.model, {
-                  tool_calls: [
-                    {
-                      index,
-                      id: toolCall.id,
-                      type: "function",
-                      function: {
-                        name: toolCall.function.name,
-                        arguments: ""
-                      }
-                    }
-                  ]
-                })
-              )
-            );
-            for (const fragment of chunkString(args, 4096)) {
-              controller.enqueue(
-                encodeSse(
-                  openAiChunk(id, request.model, {
-                    tool_calls: [
-                      {
-                        index,
-                        function: {
-                          arguments: fragment
-                        }
-                      }
-                    ]
-                  })
-                )
-              );
-            }
-          });
-          controller.enqueue(encodeSse(openAiChunk(id, request.model, {}, "tool_calls")));
-          if (request.stream_options?.include_usage) {
-            controller.enqueue(encodeSse(openAiUsageChunk(id, request.model, result.usage)));
-          }
-        } else {
-          if (shouldIncludeReasoning(request) && result.reasoningContent) {
-            controller.enqueue(
-              encodeSse(openAiChunk(id, request.model, { reasoning_content: result.reasoningContent }))
-            );
-          }
-          if (result.content) {
-            controller.enqueue(encodeSse(openAiChunk(id, request.model, { content: result.content })));
-          }
-          controller.enqueue(
-            encodeSse(
-              openAiChunk(
-                id,
-                request.model,
-                {},
-                "stop"
-              )
-            )
-          );
-          if (request.stream_options?.include_usage) {
-            controller.enqueue(encodeSse(openAiUsageChunk(id, request.model, result.usage)));
-          }
-        }
-
+        enqueueToolBridgeResult(controller, request, result, id, true);
         controller.enqueue(encodeSse("[DONE]"));
         controller.close();
       } finally {
@@ -226,17 +179,186 @@ export function streamToolBridgeResult(
   });
 }
 
+export function streamToolBridge(
+  zai: ZaiClient,
+  request: ChatCompletionRequest,
+  id = `chatcmpl-${randomUUID()}`,
+  signal: AbortSignal,
+  onDone?: () => void
+): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      controller.enqueue(encodeSse(openAiChunk(id, request.model, { role: "assistant" })));
+      try {
+        const result = await maybeRunToolBridge(zai, request, signal, {
+          onContentDelta: (delta) => {
+            controller.enqueue(encodeSse(openAiChunk(id, request.model, { content: delta })));
+          },
+          onReasoningDelta: (delta) => {
+            if (shouldIncludeReasoning(request)) {
+              controller.enqueue(encodeSse(openAiChunk(id, request.model, { reasoning_content: delta })));
+            }
+          }
+        });
+        if (!result) {
+          controller.enqueue(encodeSse(openAiChunk(id, request.model, {}, "stop")));
+        } else {
+          enqueueToolBridgeResult(controller, request, result, id, false);
+        }
+        controller.enqueue(encodeSse("[DONE]"));
+        controller.close();
+      } catch (error) {
+        if (isAbortError(error) || signal.aborted) {
+          logger.info("TOOLS", "Tool bridge stream cancelled", { response_id: id });
+          closeWithDone(controller);
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error("TOOLS", "Tool bridge stream failed", message);
+        enqueueToolBridgeError(controller, request, id, message);
+      } finally {
+        onDone?.();
+      }
+    },
+    cancel() {
+      onDone?.();
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no"
+    }
+  });
+}
+
+function enqueueToolBridgeResult(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  request: ChatCompletionRequest,
+  result: ToolBridgeResult,
+  id: string,
+  includeRole: boolean
+): void {
+  if (includeRole) {
+    controller.enqueue(encodeSse(openAiChunk(id, request.model, { role: "assistant" })));
+  }
+
+  if (result.kind === "tool_calls") {
+    result.toolCalls.forEach((toolCall, index) => {
+      const args = toolCall.function.arguments;
+      controller.enqueue(
+        encodeSse(
+          openAiChunk(id, request.model, {
+            tool_calls: [
+              {
+                index,
+                id: toolCall.id,
+                type: "function",
+                function: {
+                  name: toolCall.function.name,
+                  arguments: ""
+                }
+              }
+            ]
+          })
+        )
+      );
+      for (const fragment of chunkString(args, 4096)) {
+        controller.enqueue(
+          encodeSse(
+            openAiChunk(id, request.model, {
+              tool_calls: [
+                {
+                  index,
+                  function: {
+                    arguments: fragment
+                  }
+                }
+              ]
+            })
+          )
+        );
+      }
+    });
+    controller.enqueue(encodeSse(openAiChunk(id, request.model, {}, "tool_calls")));
+    if (request.stream_options?.include_usage) {
+      controller.enqueue(encodeSse(openAiUsageChunk(id, request.model, result.usage)));
+    }
+    return;
+  }
+
+  if (shouldIncludeReasoning(request) && result.reasoningContent && !result.streamedContent) {
+    controller.enqueue(encodeSse(openAiChunk(id, request.model, { reasoning_content: result.reasoningContent })));
+  }
+  if (result.content && !result.streamedContent) {
+    for (const fragment of chunkString(result.content, 4096)) {
+      controller.enqueue(encodeSse(openAiChunk(id, request.model, { content: fragment })));
+    }
+  }
+  controller.enqueue(encodeSse(openAiChunk(id, request.model, {}, "stop")));
+  if (request.stream_options?.include_usage) {
+    controller.enqueue(encodeSse(openAiUsageChunk(id, request.model, result.usage)));
+  }
+}
+
+function enqueueToolBridgeError(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  request: ChatCompletionRequest,
+  id: string,
+  message: string
+): void {
+  try {
+    controller.enqueue(encodeSse(openAiChunk(id, request.model, {}, "stop")));
+    controller.enqueue(encodeSse({ ...openAIError(message, 502, "upstream_error").body, id }));
+  } catch {
+    // The client may already have closed the socket.
+  }
+  closeWithDone(controller);
+}
+
+function closeWithDone(controller: ReadableStreamDefaultController<Uint8Array>): void {
+  try {
+    controller.enqueue(encodeSse("[DONE]"));
+  } catch {
+    // The client may already have closed the socket.
+  }
+  try {
+    controller.close();
+  } catch {
+    // Already closed.
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || /aborted|abort/i.test(error.message));
+}
+
 async function runClientToolSelection(
   zai: ZaiClient,
   request: ChatCompletionRequest,
   tools: ToolSpec[],
-  signal: AbortSignal
+  signal: AbortSignal,
+  hooks: ToolBridgeStreamHooks
 ): Promise<ToolBridgeResult> {
   let retryNote: string | null = null;
   let usage: OpenAIUsage | null = null;
+  const requireToolForPrompt = shouldRequireToolForPrompt(request, tools);
 
   for (let attempt = 0; attempt <= TOOL_RETRY_LIMIT; attempt += 1) {
-    const completion = await callZaiWithToolPrompt(zai, request, tools, "client", retryNote, signal);
+    const allowTextStreaming = !retryNote && !mustCallTool(request.tool_choice) && !requireToolForPrompt;
+    const completion = await callZaiWithToolPrompt(
+      zai,
+      request,
+      tools,
+      "client",
+      retryNote,
+      signal,
+      allowTextStreaming ? hooks : {}
+    );
     usage = addUsage(usage, completion.usage);
     const parseSource = toolParseSource(completion);
     const parsed = parseToolCalls(parseSource, tools);
@@ -260,35 +382,23 @@ async function runClientToolSelection(
     }
 
     if (!parsed.sawCandidate) {
-      const synthesized = synthesizeToolCalls(request, tools, parseSource);
-      if (synthesized.length > 0) {
-        logger.table(
-          "TOOLS",
-          "tool_calls -> synthesized",
-          synthesized.map((call) => ({
-            id: call.id,
-            name: call.function.name,
-            bytes: call.function.arguments.length
-          }))
-        );
-        return {
-          kind: "tool_calls",
-          toolCalls: synthesized,
-          usage,
-          rawContent: completion.content
-        };
-      }
-
-      if (mustCallTool(request.tool_choice)) {
+      if (mustCallTool(request.tool_choice) || requireToolForPrompt) {
         logToolFormatError("client", parseSource, ["Required tool call was not found"]);
-        retryNote = `You did not call a required tool. Return only a valid <tool_calls> JSON block.`;
+        if (attempt >= TOOL_RETRY_LIMIT) {
+          throw new Error("TOOL_REQUIRED_NOT_CALLED: model did not emit a required tool call");
+        }
+        retryNote = requireToolForPrompt
+          ? "The user is asking about repository/files/codebase state. Do not answer in natural language. Return only a valid tool_calls JSON object using an available filesystem/search/read tool."
+          : "You did not call a required tool. Return only a valid <tool_calls> JSON block.";
         continue;
       }
+      completion.flushFinalText();
       return {
         kind: "final",
         content: completion.content,
         reasoningContent: completion.reasoningContent,
-        usage
+        usage,
+        streamedContent: completion.streamedContent
       };
     }
 
@@ -302,7 +412,8 @@ async function runClientToolSelection(
 async function runProxyToolLoop(
   zai: ZaiClient,
   request: ChatCompletionRequest,
-  signal: AbortSignal
+  signal: AbortSignal,
+  hooks: ToolBridgeStreamHooks
 ): Promise<ToolBridgeResult> {
   let messages = [...request.messages];
   let usage: OpenAIUsage | null = null;
@@ -316,7 +427,8 @@ async function runProxyToolLoop(
       PROXY_TOOL_SPECS,
       "proxy",
       retryNote,
-      signal
+      signal,
+      !retryNote ? hooks : {}
     );
     usage = addUsage(usage, completion.usage);
     const parseSource = toolParseSource(completion);
@@ -324,11 +436,13 @@ async function runProxyToolLoop(
 
     if (!parsed.ok) {
       if (!parsed.sawCandidate) {
+        completion.flushFinalText();
         return {
           kind: "final",
           content: completion.content,
           reasoningContent: completion.reasoningContent,
-          usage
+          usage,
+          streamedContent: completion.streamedContent
         };
       }
       logToolFormatError("proxy", completion.content, parsed.errors);
@@ -361,11 +475,23 @@ async function callZaiWithToolPrompt(
   tools: ToolSpec[],
   mode: "client" | "proxy",
   retryNote: string | null,
-  signal: AbortSignal
+  signal: AbortSignal,
+  hooks: ToolBridgeStreamHooks = {}
 ) {
   const toolRequest = withToolInstructions(request, tools, mode, retryNote);
+  const textGate = createToolTextGate(hooks.onContentDelta);
   const upstream = await zai.createCompletionStream(toolRequest, signal);
-  return collectZaiCompletion(upstream.body);
+  const collectOptions = {
+    returnPartialOnError: true,
+    onContentDelta: (delta: string) => textGate.push(delta),
+    ...(hooks.onReasoningDelta ? { onReasoningDelta: hooks.onReasoningDelta } : {})
+  };
+  const completion = await collectZaiCompletion(upstream.body, collectOptions);
+  return {
+    ...completion,
+    flushFinalText: () => textGate.flush(completion.content),
+    streamedContent: textGate.released()
+  };
 }
 
 function withToolInstructions(
@@ -375,13 +501,16 @@ function withToolInstructions(
   retryNote: string | null
 ): ChatCompletionRequest {
   const instruction = buildToolInstruction(request, tools, mode, retryNote);
+  const { prompt_cache_key: _promptCacheKey, ...baseRequest } = request;
   return {
-    ...request,
+    ...baseRequest,
     stream: true,
     messages: [{ role: "developer", content: instruction }, ...request.messages],
     zai: {
       ...request.zai,
-      enable_thinking: request.zai?.enable_thinking ?? false
+      enable_thinking: request.zai?.enable_thinking ?? false,
+      force_new_chat: true,
+      conversation_key: `tool-bridge:${randomUUID()}`
     }
   };
 }
@@ -401,8 +530,12 @@ function buildToolInstruction(
   return [
     "You are connected to an OpenAI-compatible tool bridge.",
     target,
-    "You can use the listed tools by emitting tool call JSON; never claim that tool calls are unavailable when a listed tool can satisfy the request.",
+    "The listed tools are available to the client. You invoke them by emitting tool call JSON. Never say you do not have access to a listed tool.",
+    "If tool_choice is required or names a specific function, your entire answer must be a tool call for that function.",
     "Do not execute tools yourself. The proxy or client will execute them after your response is parsed.",
+    "The user's local workspace/repository is available through the listed client tools. Do not ask for a GitHub link, pasted files, or manual context when filesystem/search/read tools are listed.",
+    "For repository, filesystem, codebase, grep/search, read, write, or edit requests, call an available tool first. Do not answer from memory.",
+    "For repo analysis requests, your next message must be only tool_calls JSON for an available listing/search/read tool. Natural-language preambles before tool calls break the OpenAI client protocol.",
     "Use tools for filesystem/codebase/actions instead of pasting complete files, command output, or long patches in plain text.",
     "When a tool is needed, output only this exact JSON shape with no Markdown and no surrounding XML:",
     '{"tool_calls":[{"type":"function","function":{"name":"tool_name","arguments":{}}}]}',
@@ -415,6 +548,68 @@ function buildToolInstruction(
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+function createToolTextGate(onDelta?: (delta: string) => void): {
+  push: (delta: string) => void;
+  flush: (fallback: string) => void;
+  released: () => boolean;
+} {
+  let buffer = "";
+  let released = false;
+
+  return {
+    push(delta) {
+      if (!onDelta) {
+        return;
+      }
+      if (released) {
+        onDelta(delta);
+        return;
+      }
+
+      buffer += delta;
+      if (looksLikeToolCallPrefix(buffer)) {
+        return;
+      }
+
+      released = true;
+      const next = buffer;
+      buffer = "";
+      if (next) {
+        onDelta(next);
+      }
+    },
+    flush(fallback) {
+      if (!onDelta || released) {
+        return;
+      }
+      released = true;
+      const next = buffer || fallback;
+      buffer = "";
+      if (next) {
+        onDelta(next);
+      }
+    },
+    released() {
+      return released;
+    }
+  };
+}
+
+function looksLikeToolCallPrefix(content: string): boolean {
+  const trimmed = content.trimStart();
+  if (!trimmed) {
+    return true;
+  }
+  return (
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("[") ||
+    trimmed.startsWith("<") ||
+    trimmed.startsWith("`") ||
+    /^tool_?calls?\b/i.test(trimmed) ||
+    /^function\b/i.test(trimmed)
+  );
 }
 
 function parseToolCalls(content: string, tools: ToolSpec[]): ParseResult {
@@ -459,7 +654,7 @@ function parseToolCalls(content: string, tools: ToolSpec[]): ParseResult {
         candidateErrors.push(`tool_calls[${index}].name: unknown tool ${normalized.name}`);
         return;
       }
-      const validation = validateToolArguments(tool, normalized.arguments);
+      const validation = validateToolArguments(tool, repairToolArguments(tool, normalized.arguments));
       if (!validation.ok) {
         candidateErrors.push(...validation.errors);
         return;
@@ -512,7 +707,7 @@ function parseXmlStyleToolCalls(
     }
 
     const args = xmlArguments(block);
-    const validation = validateToolArguments(tool, args);
+    const validation = validateToolArguments(tool, repairToolArguments(tool, args));
     if (!validation.ok) {
       errors.push(...validation.errors);
       continue;
@@ -704,6 +899,48 @@ function parseArguments(value: unknown): { ok: true; value: Record<string, unkno
   return { ok: false, error: "must be a JSON object or JSON object string" };
 }
 
+function repairToolArguments(tool: ToolSpec, args: Record<string, unknown>): Record<string, unknown> {
+  const schema = tool.parameters ?? {};
+  const properties = schema.properties ?? {};
+  const required = schema.required ?? [];
+  const missing = required.filter((key) => !(key in args));
+  const extra = Object.keys(args).filter((key) => !(key in properties));
+  if (missing.length !== 1 || extra.length !== 1 || schema.additionalProperties !== false) {
+    return args;
+  }
+
+  const next = { ...args };
+  next[missing[0] as string] = next[extra[0] as string];
+  delete next[extra[0] as string];
+  return next;
+}
+
+function shouldRequireToolForPrompt(request: ChatCompletionRequest, tools: ToolSpec[]): boolean {
+  if (mustCallTool(request.tool_choice)) {
+    return true;
+  }
+  const prompt = latestUserText(request.messages);
+  if (!/(repo|reposit[oó]rio|projeto|project|codebase|workspace|arquivo|file|pasta|folder|grep|regex|search|busca|buscar|analisa|analisar|inspect|inspeciona|read|ler|edit|editar|patch)/i.test(prompt)) {
+    return false;
+  }
+  return Boolean(
+    findTool(tools, [
+      "grep",
+      "search",
+      "glob",
+      "list_directory",
+      "list_dir",
+      "directory_tree",
+      "ls",
+      "read_file",
+      "open_file",
+      "write_file",
+      "edit_file",
+      "apply_patch"
+    ])
+  );
+}
+
 async function executeToolCalls(toolCalls: OpenAIToolCall[], parallel: boolean): Promise<string[]> {
   if (parallel) {
     return Promise.all(toolCalls.map((call) => executeLoggedToolCall(call)));
@@ -763,167 +1000,13 @@ function toolParseSource(completion: { content: string; reasoningContent: string
   return [completion.content, completion.reasoningContent].filter(Boolean).join("\n");
 }
 
-function synthesizeToolCalls(
-  request: ChatCompletionRequest,
-  tools: ToolSpec[],
-  modelText: string
-): OpenAIToolCall[] {
-  const prompt = latestUserText(request.messages);
-  const requestedTool = namedToolChoice(request.tool_choice);
-  const tool =
-    (requestedTool ? tools.find((item) => item.name === requestedTool) : null) ??
-    selectFilesystemTool(tools, prompt, modelText);
-  if (!tool) {
-    return [];
-  }
-
-  const args = synthesizeArguments(tool, prompt, modelText);
-  if (!args) {
-    return [];
-  }
-
-  const validation = validateToolArguments(tool, args);
-  if (!validation.ok) {
-    logger.error("TOOLS", "Synthesized tool call failed schema validation", {
-      tool: tool.name,
-      errors: validation.errors,
-      args
-    });
-    return [];
-  }
-
-  return [
-    {
-      id: `call_${randomUUID()}`,
-      type: "function",
-      function: {
-        name: tool.name,
-        arguments: JSON.stringify(validation.value)
-      }
-    }
-  ];
-}
-
-function selectFilesystemTool(tools: ToolSpec[], prompt: string, modelText: string): ToolSpec | null {
-  const combined = `${prompt}\n${modelText}`;
-  if (/(analisa|analisar|olha|inspeciona|inspect|analyze|projeto|project|codebase|workspace|arquivos|files|estrutura|architecture|arquitetura)/i.test(combined)) {
-    return findTool(tools, ["list_directory", "list_dir", "directory_tree", "ls", "glob", "read_file", "grep", "search"]);
-  }
-  if (/(crie|create|write|salve|save|arquivo|file|html|c[oó]digo|code)/i.test(combined)) {
-    return findTool(tools, ["write_file", "create_file"]);
-  }
-  if (/(diret[oó]rio|directory|folder|pasta|mkdir)/i.test(combined)) {
-    return findTool(tools, ["create_directory", "mkdir"]);
-  }
-  return null;
-}
-
-function synthesizeArguments(
-  tool: ToolSpec,
-  prompt: string,
-  modelText: string
-): Record<string, unknown> | null {
-  if (["write_file", "create_file"].includes(tool.name)) {
-    const pathKey = firstProperty(tool, ["path", "file_path", "filepath", "relative_path"]);
-    const contentKey = firstProperty(tool, ["content", "contents", "text", "body"]);
-    if (!pathKey || !contentKey) return null;
-    const path = extractFilePath(prompt) ?? extractFilePath(modelText);
-    const content = extractFileContent(prompt, modelText);
-    if (!path || content === null) return null;
-    return { [pathKey]: path, [contentKey]: content };
-  }
-
-  if (["create_directory", "mkdir"].includes(tool.name)) {
-    const pathKey = firstProperty(tool, ["path", "directory", "dir", "relative_path"]);
-    if (!pathKey) return null;
-    const path = extractDirectoryPath(prompt) ?? extractDirectoryPath(modelText);
-    return path ? { [pathKey]: path } : null;
-  }
-
-  if (["list_directory", "list_dir", "directory_tree", "ls"].includes(tool.name)) {
-    const pathKey = firstProperty(tool, ["path", "directory", "dir", "relative_path"]) ?? "path";
-    return { [pathKey]: "." };
-  }
-
-  if (tool.name === "glob") {
-    const patternKey = firstProperty(tool, ["pattern", "glob", "query"]) ?? "pattern";
-    return { [patternKey]: "**/*" };
-  }
-
-  if (["grep", "search"].includes(tool.name)) {
-    const queryKey = firstProperty(tool, ["query", "pattern", "search", "regex"]) ?? "query";
-    return { [queryKey]: latestSearchQuery(prompt) };
-  }
-
-  return null;
-}
-
 function findTool(tools: ToolSpec[], names: string[]): ToolSpec | null {
   return tools.find((tool) => names.includes(tool.name)) ?? null;
-}
-
-function firstProperty(tool: ToolSpec, candidates: string[]): string | null {
-  const properties = tool.parameters.properties ?? {};
-  return candidates.find((candidate) => candidate in properties) ?? null;
-}
-
-function extractFileContent(prompt: string, modelText: string): string | null {
-  const promptContent = prompt.match(/(?:conte[uú]do|content|texto)\s+(?:é|eh|as|:)?\s*[`"']?([^`"'\n.]+)[`"']?/i);
-  if (promptContent?.[1]) {
-    return promptContent[1]
-      .trim()
-      .replace(/\s+(usando|using|use|com a|with the)\b[\s\S]*$/i, "")
-      .trim();
-  }
-
-  const fenced = modelText.match(/```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)```/);
-  if (fenced?.[1] !== undefined) {
-    return fenced[1].replace(/\n$/, "");
-  }
-
-  const textBlock = modelText.match(/```text\s*\n([\s\S]*?)```/i);
-  if (textBlock?.[1] !== undefined) {
-    return textBlock[1].replace(/\n$/, "");
-  }
-
-  return modelText.trim() ? modelText.trim() : null;
-}
-
-function extractFilePath(text: string): string | null {
-  const labeled = text.match(
-    /(?:arquivo|file|path|chamado|called|named|salvar como|save as)\s+[`"']?([A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,12})[`"']?/i
-  );
-  if (labeled?.[1]) return labeled[1];
-
-  const generic = text.match(
-    /\b([A-Za-z0-9_./-]+\.(?:html|css|js|mjs|cjs|ts|tsx|jsx|json|md|txt|py|rs|go|java|c|cpp|h|hpp|yml|yaml|toml|sh|xml|svg))\b/i
-  );
-  return generic?.[1] ?? null;
-}
-
-function extractDirectoryPath(text: string): string | null {
-  const labeled = text.match(
-    /(?:diret[oó]rio|directory|folder|pasta|mkdir)\s+[`"']?([A-Za-z0-9_./-]+)[`"']?/i
-  );
-  return labeled?.[1] ?? null;
-}
-
-function latestSearchQuery(text: string): string {
-  const compact = text.trim().replace(/\s+/g, " ");
-  return compact ? compact.slice(0, 120) : ".";
 }
 
 function latestUserText(messages: OpenAIMessage[]): string {
   const latest = [...messages].reverse().find((message) => message.role === "user");
   return latest ? flattenMessageContent(latest) : "";
-}
-
-function namedToolChoice(toolChoice: unknown): string | null {
-  if (!toolChoice || typeof toolChoice !== "object") return null;
-  const record = toolChoice as Record<string, unknown>;
-  const fn = record.function && typeof record.function === "object" ? (record.function as Record<string, unknown>) : null;
-  const custom = record.custom && typeof record.custom === "object" ? (record.custom as Record<string, unknown>) : null;
-  return stringValue(fn?.name) ?? stringValue(custom?.name);
 }
 
 function toolChoiceAllowsTools(toolChoice: unknown): boolean {

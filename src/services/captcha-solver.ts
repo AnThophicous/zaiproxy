@@ -12,6 +12,7 @@ type CaptchaSession = {
   context: BrowserContext;
   page: Page;
   preparedAt: number;
+  headless: boolean;
 };
 
 export class CaptchaSolver {
@@ -21,7 +22,7 @@ export class CaptchaSolver {
 
   async solve(account: ZaiAccount): Promise<string> {
     const previous = this.solveQueues.get(account.id) ?? Promise.resolve();
-    const solve = previous.catch(() => undefined).then(() => this.solveFresh(account));
+    const solve = previous.catch(() => undefined).then(() => this.solveWithFallback(account));
     const queueTail = solve.then(
       () => undefined,
       () => undefined
@@ -37,22 +38,33 @@ export class CaptchaSolver {
     }
   }
 
-  private async getSession(account: ZaiAccount): Promise<CaptchaSession> {
+  private async solveWithFallback(account: ZaiAccount): Promise<string> {
+    try {
+      return await this.solveFresh(account, config.captcha.headless);
+    } catch (error) {
+      if (!config.captcha.headless || !isCaptchaTimeoutError(error)) {
+        throw error;
+      }
+      logger.warn("AUTH", "Headless Z.ai captcha timed out; opening visible Chromium for manual verification");
+      await this.closeSession();
+      return await this.solveFresh(account, false);
+    }
+  }
+
+  private async getSession(account: ZaiAccount, headless: boolean): Promise<CaptchaSession> {
     this.clearIdleTimer();
-    if (this.session?.accountId === account.id && !this.session.page.isClosed()) {
+    if (this.session?.accountId === account.id && this.session.headless === headless && !this.session.page.isClosed()) {
       return this.session;
     }
 
     await this.closeSession();
     const { chromium } = await import("playwright");
-    const profilePath = ensureDir(join(config.runtimeDir, "captcha-profiles", sanitizeProfileSegment(account.id)));
-    logger.warn(
-      "AUTH",
-      `Z.ai captcha required; starting ${config.captcha.headless ? "headless" : "visible"} Chromium at ${profilePath}`
-    );
+    const profileName = `${sanitizeProfileSegment(account.id)}${headless ? "" : "-visible"}`;
+    const profilePath = ensureDir(join(config.runtimeDir, "captcha-profiles", profileName));
+    logger.warn("AUTH", `Z.ai captcha required; starting ${headless ? "headless" : "visible"} Chromium at ${profilePath}`);
 
     const context = await chromium.launchPersistentContext(profilePath, {
-      headless: config.captcha.headless,
+      headless,
       viewport: { width: 1365, height: 900 },
       args: [
         "--disable-blink-features=AutomationControlled",
@@ -77,7 +89,7 @@ export class CaptchaSolver {
     });
 
     const page = context.pages()[0] ?? (await context.newPage());
-    this.session = { accountId: account.id, context, page, preparedAt: 0 };
+    this.session = { accountId: account.id, context, page, preparedAt: 0, headless };
     return this.session;
   }
 
@@ -120,24 +132,42 @@ export class CaptchaSolver {
     return page;
   }
 
-  private async solveFresh(account: ZaiAccount): Promise<string> {
-    const session = await this.getSession(account);
+  private async solveFresh(account: ZaiAccount, headless: boolean): Promise<string> {
+    const session = await this.getSession(account, headless);
 
     try {
       const page = await this.preparePage(session, account);
+      if (!headless) {
+        await page.bringToFront().catch(() => {});
+      }
+      const timeoutMs = headless ? Math.min(config.captcha.timeoutMs, 45_000) : config.captcha.timeoutMs;
       const captcha = await page.evaluate(
-        ({ language, scriptUrl, timeoutMs }) =>
+        ({ language, scriptUrl, timeoutMs, visible }) =>
           new Promise<string>((resolve, reject) => {
             const elementId = "chat-captcha-element";
             const buttonId = "chat-captcha-trigger";
+            const overlayId = "chat-captcha-overlay";
             let instance: { refresh?: () => void } | null = null;
             let settled = false;
             const timer = window.setTimeout(() => fail("captcha timed out"), timeoutMs);
+
+            const removeCaptchaNodes = () => {
+              document.getElementById(overlayId)?.remove();
+              document.getElementById(elementId)?.remove();
+              document.getElementById(buttonId)?.remove();
+            };
+
+            const cleanupAfterAttempt = () => {
+              if (visible) {
+                document.getElementById(overlayId)?.remove();
+              }
+            };
 
             const finish = (value: unknown) => {
               if (settled) return;
               settled = true;
               window.clearTimeout(timer);
+              cleanupAfterAttempt();
               try {
                 instance?.refresh?.();
               } catch {
@@ -166,47 +196,87 @@ export class CaptchaSolver {
               if (settled) return;
               settled = true;
               window.clearTimeout(timer);
+              cleanupAfterAttempt();
               reject(new Error(message));
             };
 
-            const ensureNode = (id: string, tagName: "div" | "button") => {
-              let node = document.getElementById(id);
-              if (!node) {
-                node = document.createElement(tagName);
-                node.id = id;
-                node.style.cssText =
-                  "position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;opacity:0;overflow:hidden;";
-                if (tagName === "button") {
-                  (node as HTMLButtonElement).type = "button";
-                  node.setAttribute("aria-hidden", "true");
-                  (node as HTMLButtonElement).tabIndex = -1;
-                }
-                document.body.appendChild(node);
-              }
-              return node;
+            const createHiddenNodes = () => {
+              removeCaptchaNodes();
+              const element = document.createElement("div");
+              element.id = elementId;
+              element.style.cssText =
+                "position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;opacity:0;overflow:hidden;";
+              const button = document.createElement("button");
+              button.id = buttonId;
+              button.type = "button";
+              button.setAttribute("aria-hidden", "true");
+              button.tabIndex = -1;
+              button.style.cssText =
+                "position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;opacity:0;overflow:hidden;";
+              document.body.appendChild(element);
+              document.body.appendChild(button);
+              return button;
+            };
+
+            const createVisibleNodes = () => {
+              removeCaptchaNodes();
+              const overlay = document.createElement("div");
+              overlay.id = overlayId;
+              overlay.style.cssText =
+                "position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.76);";
+
+              const panel = document.createElement("div");
+              panel.style.cssText =
+                "width:380px;max-width:calc(100vw - 32px);padding:22px;border-radius:12px;background:#fff;box-shadow:0 20px 70px rgba(15,23,42,0.24);font-family:Arial,sans-serif;color:#111827;";
+
+              const title = document.createElement("div");
+              title.textContent = "Z.ai security verification";
+              title.style.cssText = "font-size:16px;font-weight:700;margin-bottom:8px;";
+
+              const hint = document.createElement("div");
+              hint.textContent = "Complete the challenge to continue the proxy request.";
+              hint.style.cssText = "font-size:13px;line-height:1.45;color:#4b5563;margin-bottom:16px;";
+
+              const element = document.createElement("div");
+              element.id = elementId;
+              element.style.cssText = "min-height:48px;margin-bottom:14px;";
+
+              const button = document.createElement("button");
+              button.id = buttonId;
+              button.type = "button";
+              button.textContent = "Start verification";
+              button.style.cssText =
+                "width:100%;height:40px;border:1px solid #d1d5db;border-radius:8px;background:#111827;color:#fff;font-size:14px;font-weight:600;cursor:pointer;";
+
+              panel.append(title, hint, element, button);
+              overlay.appendChild(panel);
+              document.body.appendChild(overlay);
+              return button;
             };
 
             const loadScript = () =>
               new Promise<void>((scriptResolve, scriptReject) => {
+                window.AliyunCaptchaConfig = { region: "sgp", prefix: "no8xfe" };
                 if (window.initAliyunCaptcha) {
                   scriptResolve();
                   return;
                 }
-                window.AliyunCaptchaConfig = { region: "sgp", prefix: "no8xfe" };
-                const existing = document.querySelector<HTMLScriptElement>(`script[src="${scriptUrl}"]`);
-                if (existing) {
-                  existing.addEventListener("load", () => scriptResolve(), { once: true });
-                  existing.addEventListener("error", () => scriptReject(new Error("captcha script load failed")), {
-                    once: true
-                  });
-                  return;
-                }
+                document.querySelector<HTMLScriptElement>(`script[src="${scriptUrl}"]`)?.remove();
                 const script = document.createElement("script");
                 script.src = scriptUrl;
                 script.onload = () => scriptResolve();
                 script.onerror = () => scriptReject(new Error("captcha script load failed"));
                 document.head.appendChild(script);
               });
+
+            const clickTrigger = (button: HTMLButtonElement) => {
+              if (settled) return;
+              try {
+                button.click();
+              } catch (error) {
+                fail(error instanceof Error ? error.message : String(error));
+              }
+            };
 
             const messages = {
               cn: {
@@ -243,8 +313,7 @@ export class CaptchaSolver {
 
             loadScript()
               .then(() => {
-                ensureNode(elementId, "div");
-                const button = ensureNode(buttonId, "button") as HTMLButtonElement;
+                const button = visible ? createVisibleNodes() : createHiddenNodes();
                 if (!window.initAliyunCaptcha) {
                   fail("initAliyunCaptcha missing");
                   return;
@@ -259,13 +328,13 @@ export class CaptchaSolver {
                   language: language === "en-US" ? "en" : "cn",
                   timeout: 10000,
                   delayBeforeSuccess: false,
-                  success: finish,
-                  fail: () => window.setTimeout(() => button.click(), 250),
+                  success: (value: unknown) => finish(value),
+                  fail: () => window.setTimeout(() => clickTrigger(button), 250),
                   onError: (error: unknown) => fail(`captcha service error: ${String(error)}`),
                   onClose: () => fail("captcha cancelled by user"),
                   getInstance: (value: { refresh?: () => void }) => {
                     instance = value;
-                    window.setTimeout(() => button.click(), 250);
+                    window.setTimeout(() => clickTrigger(button), 250);
                   }
                 });
               })
@@ -274,11 +343,12 @@ export class CaptchaSolver {
         {
           language: config.zai.acceptLanguage,
           scriptUrl: CAPTCHA_SCRIPT_URL,
-          timeoutMs: config.captcha.timeoutMs
+          timeoutMs,
+          visible: !headless
         }
       );
 
-      logger.success("AUTH", "Z.ai captcha verification completed");
+      logger.success("AUTH", "Z.ai captcha verification completed", captchaTokenSummary(captcha));
       return captcha;
     } finally {
       if (!config.captcha.keepBrowserOpen) {
@@ -307,6 +377,25 @@ export class CaptchaSolver {
 
 function sanitizeProfileSegment(value: string): string {
   return value.trim().replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "default";
+}
+
+function isCaptchaTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.message.toLowerCase().includes("captcha timed out");
+}
+
+function captchaTokenSummary(token: string): Record<string, unknown> {
+  const summary: Record<string, unknown> = { length: token.length };
+  try {
+    const decoded = Buffer.from(token, "base64").toString("utf8");
+    const parsed = JSON.parse(decoded) as unknown;
+    summary.decoded_length = decoded.length;
+    summary.decoded_keys = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? Object.keys(parsed).sort()
+      : [];
+  } catch {
+    summary.decoded_keys = [];
+  }
+  return summary;
 }
 
 declare global {
